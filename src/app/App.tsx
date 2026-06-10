@@ -13,6 +13,7 @@ import { getRuleset } from "../core/ruleset/ruleset";
 import "../systems"; // registers all available rule systems
 import CombatTracker from "../modules/combat/CombatTracker";
 import MapView from "../modules/map/MapView";
+import MembersPanel from "./MembersPanel";
 import SignIn from "./auth/SignIn";
 import { useSession } from "./auth/useSession";
 
@@ -130,6 +131,7 @@ function MainApp({ ownerId, userLabel, onSignOut }: { ownerId: Id; userLabel?: s
           ? "Storage is cloud (Supabase) with realtime sync and row-level security; the first member to join a campaign is its GM."
           : "Storage is local (IndexedDB) and persists across reloads; use Export/Import for backups."}
       </p>
+      {cloud && <MembersPanel campaignId={CAMPAIGN_ID} currentUserId={ownerId} />}
       <MapView repo={repo} ruleset={ruleset} campaignId={CAMPAIGN_ID} mapId={MAP_ID} sceneId={SCENE_ID} ownerId={ownerId} />
       <CombatTracker repo={repo} ruleset={ruleset} campaignId={CAMPAIGN_ID} sceneId={SCENE_ID} ownerId={ownerId} />
     </div>

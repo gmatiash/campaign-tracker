@@ -9,9 +9,10 @@
 
 -- Who belongs to which campaign, and their role.
 create table if not exists public.campaign_members (
-  campaign_id text not null,
-  user_id     uuid not null references auth.users (id) on delete cascade,
-  role        text not null default 'player' check (role in ('gm', 'player')),
+  campaign_id  text not null,
+  user_id      uuid not null references auth.users (id) on delete cascade,
+  role         text not null default 'player' check (role in ('gm', 'player')),
+  display_name text,
   primary key (campaign_id, user_id)
 );
 
@@ -61,12 +62,30 @@ begin
     return;
   end if;
   select exists (select 1 from public.campaign_members where campaign_id = cid and role = 'gm') into has_gm;
-  insert into public.campaign_members (campaign_id, user_id, role)
-  values (cid, auth.uid(), case when has_gm then 'player' else 'gm' end);
+  insert into public.campaign_members (campaign_id, user_id, role, display_name)
+  values (cid, auth.uid(), case when has_gm then 'player' else 'gm' end,
+          coalesce(auth.email(), left(auth.uid()::text, 8)));
 end;
 $$;
 
 grant execute on function public.ensure_membership(text) to authenticated;
+
+-- Change a member's role. GM-only, and refuses to demote the last GM.
+create or replace function public.set_member_role(cid text, target uuid, new_role text)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not public.is_gm(cid) then raise exception 'only a GM can change roles'; end if;
+  if new_role not in ('gm', 'player') then raise exception 'invalid role'; end if;
+  if new_role = 'player'
+     and exists (select 1 from public.campaign_members where campaign_id = cid and user_id = target and role = 'gm')
+     and (select count(*) from public.campaign_members where campaign_id = cid and role = 'gm') <= 1 then
+    raise exception 'cannot demote the last GM';
+  end if;
+  update public.campaign_members set role = new_role where campaign_id = cid and user_id = target;
+end;
+$$;
+
+grant execute on function public.set_member_role(text, uuid, text) to authenticated;
 
 -- ---------------------------------------------------------------------------
 -- Row-Level Security
@@ -108,5 +127,14 @@ create policy records_delete on public.records for delete to authenticated
 -- Realtime
 -- ---------------------------------------------------------------------------
 -- Broadcast row changes so other clients live-update. Postgres-changes respects
--- the SELECT policy above for authenticated subscribers.
-alter publication supabase_realtime add table public.records;
+-- the SELECT policy above for authenticated subscribers. Guarded so re-running
+-- this script does not fail with "already member of publication".
+do $$
+begin
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'records'
+  ) then
+    alter publication supabase_realtime add table public.records;
+  end if;
+end $$;
