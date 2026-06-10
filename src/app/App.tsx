@@ -1,5 +1,5 @@
 // src/app/App.tsx
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import type { Campaign, Id, Scene } from "../core/domain/domain";
 import type { Asset, MapDoc } from "../core/domain/map";
@@ -123,8 +123,20 @@ const btnStyle: CSSProperties = {
 function MainApp({ ownerId, userLabel, onSignOut }: { ownerId: Id; userLabel?: string; onSignOut?: () => void }) {
   const ruleset = useMemo(() => getRuleset(DEMO_RULESET_ID), []);
   const fileRef = useRef<HTMLInputElement>(null);
+  const [isGm, setIsGm] = useState<boolean>(!cloud);
 
-  useEffect(() => { void bootstrap(ownerId); }, [ownerId]);
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      await bootstrap(ownerId);
+      if (!cloud || !supabase) { if (alive) setIsGm(true); return; }
+      const { data } = await supabase
+        .from("campaign_members").select("role")
+        .eq("campaign_id", CAMPAIGN_ID).eq("user_id", ownerId).maybeSingle();
+      if (alive) setIsGm(data?.role === "gm");
+    })();
+    return () => { alive = false; };
+  }, [ownerId]);
 
   const onExport = async () => {
     const backup = await exportCampaign(repo, CAMPAIGN_ID);
@@ -176,7 +188,7 @@ function MainApp({ ownerId, userLabel, onSignOut }: { ownerId: Id; userLabel?: s
           : "Storage is local (IndexedDB) and persists across reloads; use Export/Import for backups."}
       </p>
       {cloud && <MembersPanel campaignId={CAMPAIGN_ID} currentUserId={ownerId} />}
-      <MapView repo={repo} ruleset={ruleset} campaignId={CAMPAIGN_ID} mapId={MAP_ID} sceneId={SCENE_ID} />
+      <MapView repo={repo} ruleset={ruleset} campaignId={CAMPAIGN_ID} mapId={MAP_ID} sceneId={SCENE_ID} isGm={isGm} />
       <CombatTracker repo={repo} ruleset={ruleset} campaignId={CAMPAIGN_ID} sceneId={SCENE_ID} ownerId={ownerId} />
     </div>
   );
