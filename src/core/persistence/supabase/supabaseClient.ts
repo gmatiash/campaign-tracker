@@ -8,6 +8,11 @@ const key = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? import.meta.env.VIT
 /** True when URL + a browser key are present; otherwise the app runs local-only. */
 export const isSupabaseConfigured = Boolean(url && key);
 
+if (typeof window !== "undefined") {
+  // Diagnostic only (no secret values logged): tells you what the build saw.
+  console.info("[supabase] configured:", isSupabaseConfigured, { hasUrl: Boolean(url), hasKey: Boolean(key) });
+}
+
 /** Single shared client, or null when not configured. */
 export const supabase: SupabaseClient | null = isSupabaseConfigured
   ? createClient(url as string, key as string, {
