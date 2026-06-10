@@ -137,7 +137,7 @@ export default function CombatTracker({ repo, ruleset, campaignId, sceneId, owne
           await removeImage(await repo.get<Asset>("assets", m.backgroundAssetId));
           await repo.remove("assets", m.backgroundAssetId).catch(() => undefined);
         }
-        await repo.put<MapDoc>("maps", { ...m, tokens: [], aoeTemplates: [], backgroundAssetId: undefined });
+        await repo.put<MapDoc>("maps", { ...m, tokens: [], aoeTemplates: [], walls: [], fog: { enabled: false, revealed: [] }, backgroundAssetId: undefined });
       }
       if (scene) await repo.put<Scene>("scenes", { ...scene, round: 1, activeEntityId: undefined });
       clearHistory();

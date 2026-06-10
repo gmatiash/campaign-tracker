@@ -45,6 +45,7 @@ export interface Wall {
   blocksLight: boolean;
   blocksLineOfSight: boolean;
   blocksEffect: boolean;
+  door?: boolean; // a door: blocks like a wall but is shown to players from a revealed side
 }
 
 export interface FogState {

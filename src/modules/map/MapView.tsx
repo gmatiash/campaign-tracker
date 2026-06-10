@@ -105,9 +105,11 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
   const [tplDrag, setTplDrag] = useState<TplDrag | null>(null);
   const [tplOrigin, setTplOrigin] = useState<{ ix: number; iy: number } | null>(null);
   const [showReach, setShowReach] = useState(false);
-  const [fogTool, setFogTool] = useState<"off" | "reveal" | "hide" | "room" | "wall">("off");
+  const [fogTool, setFogTool] = useState<"off" | "reveal" | "hide" | "room" | "wall" | "door">("off");
+  const [roomMode, setRoomMode] = useState<"reveal" | "hide">("reveal");
   const [viewAsPlayer, setViewAsPlayer] = useState(false);
-  const paintRef = useRef<"reveal" | "hide" | null>(null);
+  const [boxRect, setBoxRect] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
+  const boxStartRef = useRef<{ gx: number; gy: number } | null>(null);
   const wallStartRef = useRef<{ ix: number; iy: number } | null>(null);
 
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -272,13 +274,14 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
   };
   const fromKeys = (set: Set<string>): Array<[number, number]> => [...set].map((k) => k.split(",").map(Number) as [number, number]);
 
-  const paintCell = (gx: number, gy: number, mode: "reveal" | "hide") => {
+  // Reveal/Hide by dragging a rectangle (box) over cells.
+  const applyBox = (a: { gx: number; gy: number }, b: { gx: number; gy: number }, mode: "reveal" | "hide") => {
     if (!map) return;
     const { cols, rows } = gridDims();
-    if (gx < 0 || gy < 0 || gx >= cols || gy >= rows) return;
+    const x0 = clamp(Math.min(a.gx, b.gx), 0, cols - 1), x1 = clamp(Math.max(a.gx, b.gx), 0, cols - 1);
+    const y0 = clamp(Math.min(a.gy, b.gy), 0, rows - 1), y1 = clamp(Math.max(a.gy, b.gy), 0, rows - 1);
     const set = new Set((map.fog?.revealed ?? []).map(([x, y]) => `${x},${y}`));
-    const key = `${gx},${gy}`;
-    if (mode === "reveal") { if (set.has(key)) return; set.add(key); } else { if (!set.has(key)) return; set.delete(key); }
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) { const k = `${x},${y}`; if (mode === "reveal") set.add(k); else set.delete(k); }
     setFog({ enabled: true, revealed: fromKeys(set) });
   };
   const revealAll = () => {
@@ -289,8 +292,8 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
   };
   const hideAll = () => setFog({ enabled: true, revealed: [] });
 
-  // Flood-fill reveal from a cell, stopping at walls — reveals a whole "room".
-  const revealRoom = (sx: number, sy: number) => {
+  // Flood-fill a whole "room" (bounded by walls/doors) and reveal or hide it.
+  const floodRoom = (sx: number, sy: number, mode: "reveal" | "hide") => {
     if (!map) return;
     const { cols, rows } = gridDims();
     if (sx < 0 || sy < 0 || sx >= cols || sy >= rows) return;
@@ -309,7 +312,7 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
       step(x, y - 1, `H:${x}:${y}`);
     }
     const set = new Set((map.fog?.revealed ?? []).map(([x, y]) => `${x},${y}`));
-    for (const k of seen) set.add(k);
+    for (const k of seen) { if (mode === "reveal") set.add(k); else set.delete(k); }
     setFog({ enabled: true, revealed: fromKeys(set) });
   };
 
@@ -330,7 +333,7 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
   const removeWallNear = (cx: number, cy: number) => {
     if (!map) return;
     const w = toWorld(cx, cy); if (!w) return;
-    const wx = w.wx + map.grid.offsetX, wy = w.wy + map.grid.offsetY; // back to grid-origin world coords
+    const wx = w.wx + map.grid.offsetX, wy = w.wy + map.grid.offsetY;
     let best: Id | null = null, bestD = Infinity;
     for (const wall of map.walls ?? []) {
       const [[ax, ay], [bx, by]] = [wall.points[0], wall.points[1]];
@@ -342,21 +345,55 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
     if (best && bestD < (map.grid.cellPx * 0.6) ** 2) saveMap({ walls: (map.walls ?? []).filter((wl) => wl.id !== best) });
   };
 
+  // Nearest cell edge to a grid-relative world point (for door placement).
+  const nearestEdge = (gx: number, gy: number): { key: string; points: [[number, number], [number, number]] } => {
+    const ux = gx / (map?.grid.cellPx ?? 1), uy = gy / (map?.grid.cellPx ?? 1);
+    const dV = Math.abs(ux - Math.round(ux)), dH = Math.abs(uy - Math.round(uy));
+    if (dV <= dH) { const ix = Math.round(ux), iy = Math.floor(uy); return { key: `V:${ix}:${iy}`, points: [[ix, iy], [ix, iy + 1]] }; }
+    const iy = Math.round(uy), ix = Math.floor(ux);
+    return { key: `H:${ix}:${iy}`, points: [[ix, iy], [ix + 1, iy]] };
+  };
+  // Door = a wall edge flagged as a door: it still blocks the fog flood, but is
+  // shown to players when an adjacent cell is revealed. Click cycles none→door→none
+  // (and converts an existing plain wall into a door).
+  const toggleDoor = (cx: number, cy: number) => {
+    if (!map) return;
+    const w = toWorld(cx, cy); if (!w) return;
+    const edge = nearestEdge(w.wx, w.wy);
+    const walls = map.walls ?? [];
+    const existing = walls.find((wl) => wallEdge(wl.points[0], wl.points[1]) === edge.key);
+    if (existing && existing.door) saveMap({ walls: walls.filter((wl) => wl.id !== existing.id) });
+    else if (existing) saveMap({ walls: walls.map((wl) => (wl.id === existing.id ? { ...wl, door: true } : wl)) });
+    else saveMap({ walls: [...walls, { id: uid(), points: edge.points, blocksMovement: false, blocksLight: false, blocksLineOfSight: true, blocksEffect: false, door: true }] });
+  };
+
   const playerView = !isGm || viewAsPlayer;
   const fogActive = isGm && fogTool !== "off";
   const onFogPointerDown = (e: RPointerEvent<HTMLDivElement>) => {
     e.stopPropagation();
     e.currentTarget.setPointerCapture(e.pointerId);
-    if (fogTool === "reveal" || fogTool === "hide") { paintRef.current = fogTool; const c = pointToCell(e.clientX, e.clientY); if (c) paintCell(c.gx, c.gy, fogTool); }
-    else if (fogTool === "room") { const c = pointToCell(e.clientX, e.clientY); if (c) revealRoom(c.gx, c.gy); }
-    else if (fogTool === "wall") { wallStartRef.current = pointToIntersection(e.clientX, e.clientY); }
+    if (fogTool === "reveal" || fogTool === "hide") {
+      const c = pointToCell(e.clientX, e.clientY);
+      if (c) { boxStartRef.current = c; setBoxRect({ x0: c.gx, y0: c.gy, x1: c.gx, y1: c.gy }); }
+    } else if (fogTool === "room") {
+      const c = pointToCell(e.clientX, e.clientY); if (c) floodRoom(c.gx, c.gy, roomMode);
+    } else if (fogTool === "wall") {
+      wallStartRef.current = pointToIntersection(e.clientX, e.clientY);
+    } else if (fogTool === "door") {
+      toggleDoor(e.clientX, e.clientY);
+    }
   };
   const onFogPointerMove = (e: RPointerEvent<HTMLDivElement>) => {
-    if (paintRef.current) { const c = pointToCell(e.clientX, e.clientY); if (c) paintCell(c.gx, c.gy, paintRef.current); }
+    if (boxStartRef.current) { const c = pointToCell(e.clientX, e.clientY); if (c) setBoxRect({ x0: boxStartRef.current.gx, y0: boxStartRef.current.gy, x1: c.gx, y1: c.gy }); }
   };
   const onFogPointerUp = (e: RPointerEvent<HTMLDivElement>) => {
-    if (fogTool === "wall" && wallStartRef.current) { const end = pointToIntersection(e.clientX, e.clientY); if (end) addWallLine(wallStartRef.current, end); wallStartRef.current = null; }
-    paintRef.current = null;
+    if ((fogTool === "reveal" || fogTool === "hide") && boxStartRef.current) {
+      const c = pointToCell(e.clientX, e.clientY);
+      if (c) applyBox(boxStartRef.current, c, fogTool);
+    } else if (fogTool === "wall" && wallStartRef.current) {
+      const end = pointToIntersection(e.clientX, e.clientY); if (end) addWallLine(wallStartRef.current, end);
+    }
+    boxStartRef.current = null; wallStartRef.current = null; setBoxRect(null);
   };
   const onFogDoubleClick = (e: RPointerEvent<HTMLDivElement>) => { if (fogTool === "wall") removeWallNear(e.clientX, e.clientY); };
 
@@ -460,10 +497,21 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
         {isGm && <>
           <span style={{ ...label, marginLeft: 6 }}>Fog:</span>
           <button style={btn(C.text, fog.enabled)} onClick={() => setFog({ enabled: !fog.enabled })}>{fog.enabled ? "On" : "Off"}</button>
-          <button style={btn(C.text, fogTool === "reveal")} onClick={() => setFogTool((t) => (t === "reveal" ? "off" : "reveal"))}>Reveal</button>
-          <button style={btn(C.text, fogTool === "hide")} onClick={() => setFogTool((t) => (t === "hide" ? "off" : "hide"))}>Hide</button>
-          <button style={btn(C.text, fogTool === "room")} onClick={() => setFogTool((t) => (t === "room" ? "off" : "room"))} title="Click a cell to reveal the room (stops at walls)">Room</button>
+          <button style={btn(C.text, fogTool === "reveal")} onClick={() => setFogTool((t) => (t === "reveal" ? "off" : "reveal"))} title="Drag a box to reveal everything inside">Reveal</button>
+          <button style={btn(C.text, fogTool === "hide")} onClick={() => setFogTool((t) => (t === "hide" ? "off" : "hide"))} title="Drag a box to hide everything inside">Hide</button>
+          <button
+            style={btn(C.text, fogTool === "room")}
+            onClick={() => {
+              if (fogTool !== "room") { setFogTool("room"); setRoomMode("reveal"); }
+              else if (roomMode === "reveal") setRoomMode("hide");
+              else setFogTool("off");
+            }}
+            title="Click inside a room to reveal/hide it (stops at walls & doors). Click to switch reveal/hide."
+          >
+            {fogTool === "room" ? `Room: ${roomMode}` : "Room"}
+          </button>
           <button style={btn(C.text, fogTool === "wall")} onClick={() => setFogTool((t) => (t === "wall" ? "off" : "wall"))} title="Drag along grid lines to add walls; double-click a wall to remove">Wall</button>
+          <button style={btn(C.text, fogTool === "door")} onClick={() => setFogTool((t) => (t === "door" ? "off" : "door"))} title="Click an edge to add a door (or remove one). Doors block sight but appear to players from a revealed side.">Door</button>
           <button style={btn(C.dim)} onClick={revealAll}>Reveal all</button>
           <button style={btn(C.dim)} onClick={hideAll}>Hide all</button>
           <button style={btn(C.gold, viewAsPlayer)} onClick={() => setViewAsPlayer((v) => !v)} title="Preview exactly what players see">{viewAsPlayer ? "Player view" : "View as player"}</button>
@@ -639,23 +687,49 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
             });
           })()}
 
-          {/* fog of war + walls overlay (SVG) */}
-          {(fog.enabled || (isGm && !playerView && (map.walls?.length ?? 0) > 0)) && (() => {
+          {/* fog of war + walls + doors overlay (SVG) */}
+          {(fog.enabled || (map.walls?.length ?? 0) > 0) && (() => {
             const { cols, rows } = gridDims();
             const hidden: Array<[number, number]> = [];
             if (fog.enabled) {
               for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) if (!isRevealed(x, y)) hidden.push([x, y]);
             }
             const fogA = playerView ? 1 : 0.45;
+            const all = map.walls ?? [];
+            const walls = all.filter((w) => !w.door);
+            const doors = all.filter((w) => w.door);
+            const doorVisibleToPlayer = (w: Wall) => {
+              const [[ax, ay], [bx, by]] = [w.points[0], w.points[1]];
+              const adj: Array<[number, number]> = ay === by
+                ? [[Math.min(ax, bx), ay - 1], [Math.min(ax, bx), ay]]
+                : [[ax - 1, Math.min(ay, by)], [ax, Math.min(ay, by)]];
+              return adj.some(([x, y]) => isRevealed(x, y));
+            };
             return (
               <svg width={map.width} height={map.height} style={{ position: "absolute", left: 0, top: 0, pointerEvents: "none", zIndex: 18 }}>
                 {fog.enabled && hidden.map(([x, y]) => (
                   <rect key={`fog-${x}-${y}`} x={g.offsetX + x * g.cellPx} y={g.offsetY + y * g.cellPx} width={g.cellPx} height={g.cellPx} fill="#05070b" opacity={fogA} />
                 ))}
-                {!playerView && (map.walls ?? []).map((w) => {
+                {!playerView && walls.map((w) => {
                   const [[ax, ay], [bx, by]] = [w.points[0], w.points[1]];
                   return <line key={w.id} x1={g.offsetX + ax * g.cellPx} y1={g.offsetY + ay * g.cellPx} x2={g.offsetX + bx * g.cellPx} y2={g.offsetY + by * g.cellPx} stroke="#e8b54a" strokeWidth={4} strokeLinecap="round" opacity={0.95} />;
                 })}
+                {doors.map((w) => {
+                  if (playerView && !doorVisibleToPlayer(w)) return null;
+                  const [[ax, ay], [bx, by]] = [w.points[0], w.points[1]];
+                  const horizontal = ay === by;
+                  const mx = g.offsetX + ((ax + bx) / 2) * g.cellPx;
+                  const my = g.offsetY + ((ay + by) / 2) * g.cellPx;
+                  const long = g.cellPx * 0.6, thick = Math.max(4, g.cellPx * 0.18);
+                  const w_ = horizontal ? long : thick, h_ = horizontal ? thick : long;
+                  return <rect key={w.id} x={mx - w_ / 2} y={my - h_ / 2} width={w_} height={h_} rx={2} fill="#b9824f" stroke="#f0dcae" strokeWidth={1.5} />;
+                })}
+                {boxRect && (() => {
+                  const x0 = Math.min(boxRect.x0, boxRect.x1), x1 = Math.max(boxRect.x0, boxRect.x1);
+                  const y0 = Math.min(boxRect.y0, boxRect.y1), y1 = Math.max(boxRect.y0, boxRect.y1);
+                  const stroke = fogTool === "hide" ? C.danger : C.gold;
+                  return <rect x={g.offsetX + x0 * g.cellPx} y={g.offsetY + y0 * g.cellPx} width={(x1 - x0 + 1) * g.cellPx} height={(y1 - y0 + 1) * g.cellPx} fill={hexToRgba(stroke, 0.18)} stroke={stroke} strokeWidth={2} strokeDasharray="6 4" />;
+                })()}
               </svg>
             );
           })()}

@@ -56,7 +56,7 @@ export async function fileToImageAsset(file: File, campaignId: Id, ownerId: Id):
     const path = `${campaignId}/${id}.${extOf(file)}`;
     const { error } = await supabase.storage.from(IMAGE_BUCKET).upload(path, file, { contentType: file.type, upsert: true });
     if (error) {
-      console.warn(`[assets] Storage upload failed (${error.message}); using an inline data URL. Run supabase/03_storage.sql to enable Storage.`);
+      console.error(`[assets] Supabase Storage upload FAILED — falling back to an inline data URL (this is why the image shows on the map but is NOT in the bucket). Reason: ${error.message}. Fix: run supabase/03_storage.sql so the '${IMAGE_BUCKET}' bucket has member write policies.`);
       storageRef = await readDataUrl(file);
     } else {
       storageRef = supabase.storage.from(IMAGE_BUCKET).getPublicUrl(path).data.publicUrl;
