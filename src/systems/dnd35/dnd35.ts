@@ -77,11 +77,13 @@ const CONDITION_ICON: Record<string, string> = {
   prone: "⬇️", shaken: "😬", sickened: "🤒", stunned: "💫", unconscious: "💤",
 };
 
+const DEFEATED = new Set(["dead", "unconscious"]);
+
 const CONDITIONS: ConditionDef[] = [
   "blinded", "cowering", "dazed", "dazzled", "dead", "deafened", "entangled",
   "exhausted", "fatigued", "frightened", "grappled", "nauseated", "panicked",
   "paralyzed", "pinned", "prone", "shaken", "sickened", "stunned", "unconscious",
-].map((id) => ({ id, label: id[0].toUpperCase() + id.slice(1), icon: CONDITION_ICON[id] }));
+].map((id) => ({ id, label: id[0].toUpperCase() + id.slice(1), icon: CONDITION_ICON[id], defeated: DEFEATED.has(id) }));
 
 export const dnd35: Ruleset = {
   meta: { id: "dnd35", name: "D&D 3.5e", version: "1.0.0" },

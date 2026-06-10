@@ -3,7 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import type { Entity, Id, Scene } from "../../core/domain/domain";
 import type { Asset, MapDoc } from "../../core/domain/map";
 import { cloneEntity, createEntity } from "../../core/domain/factory";
-import { fileToImageAsset } from "../../core/assets";
+import { fileToImageAsset, removeImage } from "../../core/assets";
 import type { Repository } from "../../core/persistence/repository";
 import type { Ruleset } from "../../core/ruleset/ruleset";
 import { pushSnapshot, undoSnapshot, clearHistory, historyDepth } from "./turnHistory";
@@ -93,9 +93,14 @@ export default function CombatTracker({ repo, ruleset, campaignId, sceneId, owne
   };
   const uploadPortrait = async (e: Entity, file: File) => {
     try {
+      const prevId = e.portraitAssetId;
       const asset = await fileToImageAsset(file, campaignId, e.ownerId);
       await repo.put<Asset>("assets", asset);
       save(e, {}, { portraitAssetId: asset.id });
+      if (prevId) {
+        await removeImage(await repo.get<Asset>("assets", prevId));
+        await repo.remove("assets", prevId).catch(() => undefined);
+      }
     } catch (err) {
       console.error(err);
     }
@@ -128,7 +133,10 @@ export default function CombatTracker({ repo, ruleset, campaignId, sceneId, owne
       }
       const maps = await repo.list<MapDoc>("maps", { campaignId });
       for (const m of maps) {
-        if (m.backgroundAssetId) await repo.remove("assets", m.backgroundAssetId).catch(() => undefined);
+        if (m.backgroundAssetId) {
+          await removeImage(await repo.get<Asset>("assets", m.backgroundAssetId));
+          await repo.remove("assets", m.backgroundAssetId).catch(() => undefined);
+        }
         await repo.put<MapDoc>("maps", { ...m, tokens: [], aoeTemplates: [], backgroundAssetId: undefined });
       }
       if (scene) await repo.put<Scene>("scenes", { ...scene, round: 1, activeEntityId: undefined });

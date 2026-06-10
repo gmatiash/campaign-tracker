@@ -14,6 +14,8 @@ export interface ConditionDef {
   icon?: string;
   color?: string;
   description?: string;
+  /** Creature is out of the fight (dead/unconscious): rendered de-emphasised on the map. */
+  defeated?: boolean;
 }
 
 export interface SizeDef {

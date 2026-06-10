@@ -2,7 +2,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, PointerEvent as RPointerEvent, WheelEvent as RWheelEvent } from "react";
 import type { Entity, Id, Scene } from "../../core/domain/domain";
-import { fileToImageAsset } from "../../core/assets";
+import { fileToImageAsset, removeImage } from "../../core/assets";
 import type { AoeTemplate, Asset, GridConfig, MapDoc } from "../../core/domain/map";
 import type { Repository } from "../../core/persistence/repository";
 import type { AoeShape, Dir8, Ruleset } from "../../core/ruleset/ruleset";
@@ -169,9 +169,14 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, dis
   const loadImageFile = async (file: File) => {
     if (!map) return;
     try {
+      const prevId = map.backgroundAssetId;
       const asset = await fileToImageAsset(file, campaignId, map.ownerId);
       await repo.put<Asset>("assets", asset);
       saveMap({ backgroundAssetId: asset.id, width: asset.width, height: asset.height });
+      if (prevId) {
+        await removeImage(await repo.get<Asset>("assets", prevId));
+        await repo.remove("assets", prevId).catch(() => undefined);
+      }
     } catch (err) {
       console.error(err);
     }
@@ -430,6 +435,7 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, dis
                 .filter((c): c is NonNullable<typeof c> => !!c);
               const shown = conds.slice(0, 6);
               const extra = conds.length - shown.length;
+              const down = conds.some((c) => c.defeated); // dead / unconscious
               const badge = Math.max(10, Math.min(15, g.cellPx * 0.26));
 
               return (
@@ -437,8 +443,8 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, dis
                   onPointerDown={(ev) => onTokenPointerDown(ev, t)} onPointerMove={onTokenPointerMove} onPointerUp={onTokenPointerUp}
                   onDoubleClick={(ev) => { ev.stopPropagation(); removeToken(t.entityId); }}
                   title={`${e.name}${conds.length ? " — " + conds.map((c) => c.label).join(", ") : ""}`}
-                  style={{ position: "absolute", left: g.offsetX + gx * g.cellPx, top: g.offsetY + gy * g.cellPx, width: box, height: box, transform: `translate(${pl.dx}px, ${pl.dy}px)`, display: "flex", alignItems: "center", justifyContent: "center", cursor: "grab", zIndex: z }}>
-                  <div style={{ width: dia, height: dia, borderRadius: "50%", overflow: "hidden", background: portrait ? "#0a0c11" : `${accent}cc`, border: `2px solid ${isActive ? C.gold : "#0a0c11"}`, boxShadow: ring, display: "flex", alignItems: "center", justifyContent: "center", color: "#0a0c11", fontWeight: 800, fontSize: Math.max(9, Math.min(16, dia * 0.4)) }}>
+                  style={{ position: "absolute", left: g.offsetX + gx * g.cellPx, top: g.offsetY + gy * g.cellPx, width: box, height: box, transform: `translate(${pl.dx}px, ${pl.dy}px)`, display: "flex", alignItems: "center", justifyContent: "center", cursor: "grab", zIndex: down && !isActive && !isSel ? 4 : z }}>
+                  <div style={{ width: dia, height: dia, borderRadius: "50%", overflow: "hidden", background: portrait ? "#0a0c11" : `${accent}cc`, border: `2px solid ${isActive ? C.gold : "#0a0c11"}`, boxShadow: ring, filter: down ? "grayscale(100%)" : undefined, opacity: down ? 0.5 : 1, display: "flex", alignItems: "center", justifyContent: "center", color: "#0a0c11", fontWeight: 800, fontSize: Math.max(9, Math.min(16, dia * 0.4)) }}>
                     {portrait
                       ? <img src={portrait} alt="" draggable={false} style={{ width: "100%", height: "100%", objectFit: "cover", userSelect: "none" }} />
                       : initials(e.name)}

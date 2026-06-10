@@ -16,7 +16,6 @@ export default function MembersPanel({ campaignId, currentUserId }: { campaignId
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
-  const [copied, setCopied] = useState(false);
 
   const load = useCallback(async () => {
     if (!supabase) return;
@@ -41,11 +40,6 @@ export default function MembersPanel({ campaignId, currentUserId }: { campaignId
     if (error) setErr(error.message);
     await load();
     setBusy(false);
-  };
-
-  const copyInvite = async () => {
-    try { await navigator.clipboard.writeText(window.location.href); setCopied(true); setTimeout(() => setCopied(false), 1500); }
-    catch { /* clipboard blocked; ignore */ }
   };
 
   const btn = (color: string): CSSProperties => ({
@@ -86,8 +80,7 @@ export default function MembersPanel({ campaignId, currentUserId }: { campaignId
           </div>
 
           <div style={{ marginTop: 10, paddingTop: 10, borderTop: `1px solid ${C.border}`, fontSize: 11, color: C.dim }}>
-            <button style={btn(C.text)} onClick={copyInvite}>{copied ? "Copied!" : "Copy invite link"}</button>
-            <span style={{ marginLeft: 8 }}>Anyone who opens this link and signs in joins as a player; promote them here.</span>
+            Use <strong style={{ color: C.text }}>Invite</strong> (top of the page) to add players, then promote them to GM here.
           </div>
 
           {err && <p style={{ fontSize: 11, color: C.danger, marginBottom: 0 }}>{err}</p>}

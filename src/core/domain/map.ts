@@ -70,7 +70,8 @@ export interface Asset extends BaseRecord {
   collection: "assets";
   kind: "image";
   mime: string;
-  storageRef: string;
+  storageRef: string; // data URL (local) or public URL (Supabase Storage)
+  storagePath?: string; // object path within the Storage bucket, when cloud-backed
   width?: number;
   height?: number;
   source: "upload" | "ai"; // [future] AI map/wall generation

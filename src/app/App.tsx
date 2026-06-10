@@ -2,8 +2,9 @@
 import { useEffect, useMemo, useRef } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import type { Campaign, Id, Scene } from "../core/domain/domain";
-import type { MapDoc } from "../core/domain/map";
+import type { Asset, MapDoc } from "../core/domain/map";
 import { createEntity } from "../core/domain/factory";
+import { removeImage } from "../core/assets";
 import type { Repository } from "../core/persistence/repository";
 import { IndexedDbRepository } from "../core/persistence/indexeddb/IndexedDbRepository";
 import { SupabaseRepository } from "../core/persistence/supabase/SupabaseRepository";
@@ -15,6 +16,7 @@ import CombatTracker from "../modules/combat/CombatTracker";
 import { clearHistory } from "../modules/combat/turnHistory";
 import MapView from "../modules/map/MapView";
 import MembersPanel from "./MembersPanel";
+import InvitePanel from "./InvitePanel";
 import SignIn from "./auth/SignIn";
 import { useSession } from "./auth/useSession";
 
@@ -73,7 +75,10 @@ const WIPE_COLLECTIONS = ["entities", "maps", "scenes", "assets", "notes"] as co
 async function resetToDemo(ownerId: Id): Promise<void> {
   for (const c of WIPE_COLLECTIONS) {
     const recs = await repo.list(c, { campaignId: CAMPAIGN_ID });
-    for (const r of recs) await repo.remove(c, r.id);
+    for (const r of recs) {
+      if (c === "assets") await removeImage(r as Asset);
+      await repo.remove(c, r.id);
+    }
   }
   clearHistory();
   await seedDemo(ownerId);
@@ -161,6 +166,7 @@ function MainApp({ ownerId, userLabel, onSignOut }: { ownerId: Id; userLabel?: s
             onChange={(e) => { const f = e.target.files?.[0]; if (f) onImportFile(f); e.target.value = ""; }} />
         </label>
         <button style={{ ...btnStyle, color: "#d9544a" }} onClick={onReset}>Reset to demo</button>
+        {cloud && <InvitePanel />}
         {onSignOut && <button style={btnStyle} onClick={onSignOut}>Sign out</button>}
       </div>
       <p style={{ fontSize: 12, color: "#99a0b0", maxWidth: 700 }}>
