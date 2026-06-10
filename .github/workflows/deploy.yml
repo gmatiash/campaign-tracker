@@ -36,6 +36,7 @@ jobs:
           # Optional: set these as repository secrets to enable cloud mode on the
           # deployed site. If unset, the build runs in local-only mode.
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
       - name: Upload site artifact
         uses: actions/upload-pages-artifact@v3
