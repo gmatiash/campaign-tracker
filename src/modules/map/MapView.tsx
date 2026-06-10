@@ -1,0 +1,444 @@
+// src/modules/map/MapView.tsx
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties, PointerEvent as RPointerEvent, WheelEvent as RWheelEvent } from "react";
+import type { Entity, Id, Scene } from "../../core/domain/domain";
+import { createEntity } from "../../core/domain/factory";
+import { fileToImageAsset } from "../../core/assets";
+import type { AoeTemplate, Asset, GridConfig, MapDoc } from "../../core/domain/map";
+import type { Repository } from "../../core/persistence/repository";
+import type { AoeShape, Dir8, Ruleset } from "../../core/ruleset/ruleset";
+import type { DistanceUnit } from "../../core/units";
+import { formatDistance } from "../../core/units";
+
+const C = {
+  bg: "#0a0c11", panel: "#13161f", row: "#1a1e29", border: "#2b3142",
+  text: "#e9e3d4", dim: "#99a0b0", gold: "#d4af37", pc: "#5b8def", npc: "#e07a3c",
+};
+
+const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+const uid = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+const initials = (name: string) =>
+  name.split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0]?.toUpperCase() ?? "").join("") || "?";
+
+function hexToRgba(hex: string, a: number): string {
+  let h = hex.replace("#", "");
+  if (h.length === 3) h = h.split("").map((c) => c + c).join("");
+  const n = parseInt(h, 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+}
+
+const DIR_ARROW: Record<Dir8, string> = { N: "\u2191", NE: "\u2197", E: "\u2192", SE: "\u2198", S: "\u2193", SW: "\u2199", W: "\u2190", NW: "\u2196" };
+const DIR_ANGLE: Record<Dir8, number> = { E: 0, SE: 45, S: 90, SW: 135, W: 180, NW: 225, N: 270, NE: 315 };
+const COMPASS: (Dir8 | null)[] = ["NW", "N", "NE", "W", null, "E", "SW", "S", "SE"];
+
+interface View { scale: number; tx: number; ty: number; }
+interface DragState { entityId: Id; footprint: number; baseGx: number; baseGy: number; startX: number; startY: number; startScale: number; }
+interface TplDrag { id: Id; baseIX: number; baseIY: number; startX: number; startY: number; startScale: number; }
+
+interface Props {
+  repo: Repository;
+  ruleset: Ruleset;
+  campaignId: Id;
+  mapId: Id;
+  sceneId: Id;
+  ownerId: Id;
+  distanceUnit?: DistanceUnit; // [future] driven by Campaign.settings.distanceUnit
+}
+
+/**
+ * Battle-map view (slice 2: grid + tokens + AoE templates + reach overlay).
+ * No game rules live here: grid kind/cell distance, token sizes, reach squares
+ * and AoE cell geometry all come from the active ruleset. Distances render via
+ * formatDistance(), so the ft<->m unit hook is already wired.
+ */
+export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, ownerId, distanceUnit = "ft" }: Props) {
+  const [maps, setMaps] = useState<MapDoc[]>([]);
+  const [entities, setEntities] = useState<Entity[]>([]);
+  const [assets, setAssets] = useState<Asset[]>([]);
+  const [scenes, setScenes] = useState<Scene[]>([]);
+  const [view, setView] = useState<View>({ scale: 1, tx: 0, ty: 0 });
+  const [drag, setDrag] = useState<DragState | null>(null);
+  const [dragCell, setDragCell] = useState<{ gx: number; gy: number } | null>(null);
+  const [selected, setSelected] = useState<Id | null>(null);
+  const [selTpl, setSelTpl] = useState<Id | null>(null);
+  const [tplDrag, setTplDrag] = useState<TplDrag | null>(null);
+  const [tplOrigin, setTplOrigin] = useState<{ ix: number; iy: number } | null>(null);
+  const [showReach, setShowReach] = useState(false);
+
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const panRef = useRef<{ x: number; y: number } | null>(null);
+
+  useEffect(() => repo.subscribe<MapDoc>("maps", { campaignId }, setMaps), [repo, campaignId]);
+  useEffect(() => repo.subscribe<Entity>("entities", { campaignId }, setEntities), [repo, campaignId]);
+  useEffect(() => repo.subscribe<Asset>("assets", { campaignId }, setAssets), [repo, campaignId]);
+  useEffect(() => repo.subscribe<Scene>("scenes", { campaignId }, setScenes), [repo, campaignId]);
+
+  const map = useMemo(() => maps.find((m) => m.id === mapId) ?? null, [maps, mapId]);
+  const entityById = useMemo(() => new Map(entities.map((e) => [e.id, e] as const)), [entities]);
+  const assetById = useMemo(() => new Map(assets.map((a) => [a.id, a] as const)), [assets]);
+  const activeId = useMemo(() => scenes.find((s) => s.id === sceneId)?.activeEntityId ?? null, [scenes, sceneId]);
+  const bgSrc = useMemo(() => {
+    if (!map?.backgroundAssetId) return null;
+    return assetById.get(map.backgroundAssetId)?.storageRef ?? null;
+  }, [map, assetById]);
+
+  const sizeOf = (e: Entity) =>
+    ruleset.sizes.find((s) => s.id === (e.sizeId ?? "medium")) ??
+    { id: "medium", label: "Medium", footprint: 1, spaceFt: 5, reachFt: 5, scale: 1 };
+
+  // ---- persistence helpers -------------------------------------------------
+  const saveMap = (patch: Partial<MapDoc>) => {
+    if (!map) return;
+    repo.put<MapDoc>("maps", { ...map, ...patch, updatedAt: Date.now() });
+  };
+  const setGrid = (patch: Partial<GridConfig>) => map && saveMap({ grid: { ...map.grid, ...patch } });
+  const moveToken = (entityId: Id, gx: number, gy: number) =>
+    map && saveMap({ tokens: map.tokens.map((t) => (t.entityId === entityId ? { ...t, gx, gy } : t)) });
+  const removeToken = (entityId: Id) =>
+    map && saveMap({ tokens: map.tokens.filter((t) => t.entityId !== entityId) });
+
+  const placeToken = (entityId: Id) => {
+    if (!map) return;
+    const cols = Math.max(1, Math.floor(map.width / map.grid.cellPx));
+    const occ = new Set(map.tokens.map((t) => `${t.gx},${t.gy}`));
+    let cell = { gx: 0, gy: 0 };
+    outer: for (let gy = 0; gy < 200; gy++)
+      for (let gx = 0; gx < cols; gx++)
+        if (!occ.has(`${gx},${gy}`)) { cell = { gx, gy }; break outer; }
+    saveMap({ tokens: [...map.tokens, { entityId, gx: cell.gx, gy: cell.gy }] });
+  };
+
+  const addNpcToMap = async () => {
+    const n = entities.filter((e) => e.kind === "npc").length + 1;
+    const ent = createEntity({ campaignId, ownerId, ruleset, name: `NPC ${n}`, kind: "npc" });
+    await repo.put<Entity>("entities", ent);
+    placeToken(ent.id);
+    setSelected(ent.id);
+  };
+
+  // ---- AoE templates -------------------------------------------------------
+  const addTemplate = (shape: AoeShape) => {
+    if (!map) return;
+    const ix = Math.round(map.width / map.grid.cellPx / 2);
+    const iy = Math.round(map.height / map.grid.cellPx / 2);
+    const t: AoeTemplate = {
+      id: uid(), shape, originIX: ix, originIY: iy,
+      sizeFt: shape === "burst" ? 20 : 30, dir: "E", angleDeg: shape === "burst" ? undefined : 0,
+      color: "#e6c84f", opacity: 0.32,
+    };
+    saveMap({ aoeTemplates: [...map.aoeTemplates, t] });
+    setSelTpl(t.id); setSelected(null);
+  };
+  const updateTpl = (id: Id, patch: Partial<AoeTemplate>) =>
+    map && saveMap({ aoeTemplates: map.aoeTemplates.map((t) => (t.id === id ? { ...t, ...patch } : t)) });
+  const removeTpl = (id: Id) => { if (map) saveMap({ aoeTemplates: map.aoeTemplates.filter((t) => t.id !== id) }); setSelTpl(null); };
+
+  // ---- background upload ---------------------------------------------------
+  const loadImageFile = async (file: File) => {
+    if (!map) return;
+    try {
+      const asset = await fileToImageAsset(file, campaignId, map.ownerId);
+      await repo.put<Asset>("assets", asset);
+      saveMap({ backgroundAssetId: asset.id, width: asset.width, height: asset.height });
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  // ---- view: zoom / pan / fit ---------------------------------------------
+  const fit = () => {
+    if (!map || !viewportRef.current) return;
+    const vp = viewportRef.current.getBoundingClientRect();
+    const scale = Math.min(vp.width / map.width, vp.height / map.height) * 0.98;
+    setView({ scale, tx: (vp.width - map.width * scale) / 2, ty: (vp.height - map.height * scale) / 2 });
+  };
+  useEffect(() => { fit(); }, [map?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const onWheel = (e: RWheelEvent<HTMLDivElement>) => {
+    if (!viewportRef.current) return;
+    const vp = viewportRef.current.getBoundingClientRect();
+    const px = e.clientX - vp.left, py = e.clientY - vp.top;
+    setView((v) => {
+      const next = clamp(v.scale * (e.deltaY < 0 ? 1.1 : 1 / 1.1), 0.2, 6);
+      const wx = (px - v.tx) / v.scale, wy = (py - v.ty) / v.scale;
+      return { scale: next, tx: px - wx * next, ty: py - wy * next };
+    });
+  };
+
+  const onCanvasPointerDown = (e: RPointerEvent<HTMLDivElement>) => {
+    setSelected(null); setSelTpl(null);
+    panRef.current = { x: e.clientX, y: e.clientY };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+  const onCanvasPointerMove = (e: RPointerEvent<HTMLDivElement>) => {
+    if (!panRef.current) return;
+    const dx = e.clientX - panRef.current.x, dy = e.clientY - panRef.current.y;
+    panRef.current = { x: e.clientX, y: e.clientY };
+    setView((v) => ({ ...v, tx: v.tx + dx, ty: v.ty + dy }));
+  };
+  const endPan = () => { panRef.current = null; };
+
+  // ---- token drag (live-snap to whole cells) -------------------------------
+  const onTokenPointerDown = (e: RPointerEvent<HTMLDivElement>, t: { entityId: Id; gx: number; gy: number }) => {
+    e.stopPropagation();
+    const ent = entityById.get(t.entityId);
+    if (!ent) return;
+    setSelected(t.entityId); setSelTpl(null);
+    setDrag({ entityId: t.entityId, footprint: sizeOf(ent).footprint, baseGx: t.gx, baseGy: t.gy, startX: e.clientX, startY: e.clientY, startScale: view.scale });
+    setDragCell({ gx: t.gx, gy: t.gy });
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+  const onTokenPointerMove = (e: RPointerEvent<HTMLDivElement>) => {
+    if (!drag || !map) return;
+    const dCellX = Math.round((e.clientX - drag.startX) / drag.startScale / map.grid.cellPx);
+    const dCellY = Math.round((e.clientY - drag.startY) / drag.startScale / map.grid.cellPx);
+    const cols = Math.floor(map.width / map.grid.cellPx), rows = Math.floor(map.height / map.grid.cellPx);
+    setDragCell({
+      gx: clamp(drag.baseGx + dCellX, 0, Math.max(0, cols - drag.footprint)),
+      gy: clamp(drag.baseGy + dCellY, 0, Math.max(0, rows - drag.footprint)),
+    });
+  };
+  const onTokenPointerUp = () => {
+    if (drag && dragCell) moveToken(drag.entityId, dragCell.gx, dragCell.gy);
+    setDrag(null); setDragCell(null);
+  };
+
+  // ---- template drag (snap origin to intersections) ------------------------
+  const onTplPointerDown = (e: RPointerEvent<HTMLDivElement>, t: AoeTemplate) => {
+    e.stopPropagation();
+    setSelTpl(t.id); setSelected(null);
+    setTplDrag({ id: t.id, baseIX: t.originIX, baseIY: t.originIY, startX: e.clientX, startY: e.clientY, startScale: view.scale });
+    setTplOrigin({ ix: t.originIX, iy: t.originIY });
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+  const onTplPointerMove = (e: RPointerEvent<HTMLDivElement>) => {
+    if (!tplDrag || !map) return;
+    const dx = Math.round((e.clientX - tplDrag.startX) / tplDrag.startScale / map.grid.cellPx);
+    const dy = Math.round((e.clientY - tplDrag.startY) / tplDrag.startScale / map.grid.cellPx);
+    setTplOrigin({ ix: tplDrag.baseIX + dx, iy: tplDrag.baseIY + dy });
+  };
+  const onTplPointerUp = () => {
+    if (tplDrag && tplOrigin) updateTpl(tplDrag.id, { originIX: tplOrigin.ix, originIY: tplOrigin.iy });
+    setTplDrag(null); setTplOrigin(null);
+  };
+
+  const dragDistanceLabel = useMemo(() => {
+    if (!drag || !dragCell) return null;
+    const ft = ruleset.measureDistanceFt({ x: drag.baseGx, y: drag.baseGy }, { x: dragCell.gx, y: dragCell.gy });
+    return formatDistance(ft, { unit: distanceUnit });
+  }, [drag, dragCell, ruleset, distanceUnit]);
+
+  // ---- styles --------------------------------------------------------------
+  const btn = (color: string, on = false): CSSProperties => ({
+    background: on ? "rgba(212,175,55,0.18)" : C.row, border: `1px solid ${on ? C.gold : C.border}`,
+    color: on ? C.gold : color, borderRadius: 6, padding: "5px 9px", fontSize: 12, fontWeight: 700, cursor: "pointer",
+  });
+  const label: CSSProperties = { color: C.dim, fontSize: 11, fontWeight: 700 };
+
+  if (!map) return <div style={{ marginTop: 16, color: C.dim, fontSize: 13 }}>Loading map…</div>;
+
+  const g = map.grid;
+  const canAoe = !!ruleset.aoeCells;
+  const gridLayer: CSSProperties =
+    g.kind === "gridless" ? {} : {
+      backgroundImage: `linear-gradient(${g.color} 1px, transparent 1px), linear-gradient(90deg, ${g.color} 1px, transparent 1px)`,
+      backgroundSize: `${g.cellPx}px ${g.cellPx}px, ${g.cellPx}px ${g.cellPx}px`,
+      backgroundPosition: `${g.offsetX}px ${g.offsetY}px, ${g.offsetX}px ${g.offsetY}px`,
+    };
+  const unplaced = entities.filter((e) => !map.tokens.some((t) => t.entityId === e.id));
+  const selectedTpl = map.aoeTemplates.find((t) => t.id === selTpl) ?? null;
+
+  return (
+    <div style={{ marginTop: 16, maxWidth: 980 }}>
+      {/* toolbar: map + grid */}
+      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 10, marginBottom: 8, background: C.panel, border: `1px solid ${C.border}`, borderRadius: 8, padding: "8px 10px" }}>
+        <label style={btn(C.text)}>
+          Upload map
+          <input type="file" accept="image/*" style={{ display: "none" }}
+            onChange={(e) => { const f = e.target.files?.[0]; if (f) loadImageFile(f); e.target.value = ""; }} />
+        </label>
+        <span style={label}>Cell</span>
+        <input type="range" min={24} max={96} value={g.cellPx} onChange={(e) => setGrid({ cellPx: Number(e.target.value) })} />
+        <span style={{ ...label, width: 36 }}>{g.cellPx}px</span>
+        <span style={label}>Color</span>
+        <input type="color" value={toHex(g.color)} onChange={(e) => setGrid({ color: e.target.value })} style={{ width: 30, height: 24, padding: 0, border: `1px solid ${C.border}`, background: "transparent" }} />
+        <span style={label}>Off X</span>
+        <input type="range" min={0} max={g.cellPx} value={g.offsetX} onChange={(e) => setGrid({ offsetX: Number(e.target.value) })} />
+        <span style={label}>Y</span>
+        <input type="range" min={0} max={g.cellPx} value={g.offsetY} onChange={(e) => setGrid({ offsetY: Number(e.target.value) })} />
+        <div style={{ flex: 1 }} />
+        <button style={btn(C.text)} onClick={() => setView((v) => ({ ...v, scale: clamp(v.scale / 1.1, 0.2, 6) }))}>−</button>
+        <button style={btn(C.gold)} onClick={fit}>Fit</button>
+        <button style={btn(C.text)} onClick={() => setView((v) => ({ ...v, scale: clamp(v.scale * 1.1, 0.2, 6) }))}>+</button>
+      </div>
+
+      {/* toolbar: overlays + tokens */}
+      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, marginBottom: 8 }}>
+        <button style={btn(C.text, showReach)} onClick={() => setShowReach((s) => !s)}>Reach {showReach ? "on" : "off"}</button>
+        <button style={btn(C.npc)} onClick={addNpcToMap}>+ New NPC</button>
+        {canAoe && <>
+          <span style={{ ...label, marginLeft: 6 }}>AoE:</span>
+          <button style={btn(C.gold)} onClick={() => addTemplate("burst")}>+ Burst</button>
+          <button style={btn(C.gold)} onClick={() => addTemplate("cone")}>+ Cone</button>
+          <button style={btn(C.gold)} onClick={() => addTemplate("line")}>+ Line</button>
+        </>}
+        {unplaced.length > 0 && <>
+          <span style={{ ...label, marginLeft: 6 }}>Place:</span>
+          {unplaced.map((e) => (
+            <button key={e.id} style={btn(e.color || (e.kind === "pc" ? C.pc : C.npc))} onClick={() => placeToken(e.id)}>+ {e.name}</button>
+          ))}
+        </>}
+      </div>
+
+      {/* viewport */}
+      <div
+        ref={viewportRef}
+        onWheel={onWheel}
+        onPointerDown={onCanvasPointerDown}
+        onPointerMove={onCanvasPointerMove}
+        onPointerUp={endPan}
+        onPointerCancel={endPan}
+        onDragOver={(e) => e.preventDefault()}
+        onDrop={(e) => { e.preventDefault(); const f = e.dataTransfer.files?.[0]; if (f) loadImageFile(f); }}
+        style={{ position: "relative", height: 540, border: `1px solid ${C.border}`, borderRadius: 8, overflow: "hidden", background: C.bg, touchAction: "none" }}
+      >
+        <div style={{ position: "absolute", left: 0, top: 0, width: map.width, height: map.height, transformOrigin: "0 0", transform: `translate(${view.tx}px, ${view.ty}px) scale(${view.scale})` }}>
+          {bgSrc
+            ? <img src={bgSrc} alt="" draggable={false} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "fill", userSelect: "none" }} />
+            : <div style={{ position: "absolute", inset: 0, background: "repeating-linear-gradient(45deg,#0d1017,#0d1017 12px,#0f131c 12px,#0f131c 24px)" }} />}
+
+          <div style={{ position: "absolute", inset: 0, ...gridLayer }} />
+
+          {/* reach overlay */}
+          {showReach && map.tokens.map((t) => {
+            const e = entityById.get(t.entityId);
+            if (!e) return null;
+            const cells = ruleset.reachCells(e.sizeId ?? "medium");
+            if (!cells.length) return null;
+            const pos = drag?.entityId === t.entityId && dragCell ? dragCell : t;
+            const accent = e.color || (e.kind === "pc" ? C.pc : C.npc);
+            return cells.map((c) => (
+              <div key={`reach-${t.entityId}-${c.x}-${c.y}`} style={{ position: "absolute", left: g.offsetX + (pos.gx + c.x) * g.cellPx, top: g.offsetY + (pos.gy + c.y) * g.cellPx, width: g.cellPx, height: g.cellPx, background: hexToRgba(accent, 0.16), border: `1px solid ${hexToRgba(accent, 0.32)}`, pointerEvents: "none", zIndex: 6 }} />
+            ));
+          })}
+
+          {/* AoE templates */}
+          {map.aoeTemplates.map((t) => {
+            const cells = ruleset.aoeCells?.({ shape: t.shape, sizeFt: t.sizeFt, dir: t.dir, angleDeg: t.angleDeg, cellFt: g.cellFt }) ?? [];
+            const o = tplDrag?.id === t.id && tplOrigin ? tplOrigin : { ix: t.originIX, iy: t.originIY };
+            const sel = selTpl === t.id;
+            const fill = hexToRgba(t.color, t.opacity);
+            const edge = hexToRgba(t.color, Math.min(1, t.opacity + 0.35));
+            const oxPx = g.offsetX + o.ix * g.cellPx, oyPx = g.offsetY + o.iy * g.cellPx;
+            let minA = 0, minB = 0, maxA = 0, maxB = 0;
+            cells.forEach((c) => { minA = Math.min(minA, c.x); minB = Math.min(minB, c.y); maxA = Math.max(maxA, c.x + 1); maxB = Math.max(maxB, c.y + 1); });
+            const dotR = clamp(g.cellPx * 0.16, 4, 12);
+            return (
+              <div key={t.id}>
+                {cells.map((c) => (
+                  <div key={`${t.id}-${c.x}-${c.y}`}
+                    onPointerDown={(e) => onTplPointerDown(e, t)} onPointerMove={onTplPointerMove} onPointerUp={onTplPointerUp}
+                    onDoubleClick={(e) => { e.stopPropagation(); removeTpl(t.id); }}
+                    style={{ position: "absolute", left: g.offsetX + (o.ix + c.x) * g.cellPx, top: g.offsetY + (o.iy + c.y) * g.cellPx, width: g.cellPx, height: g.cellPx, background: fill, border: `1px solid ${edge}`, cursor: "grab", touchAction: "none", zIndex: sel ? 16 : 10 }} />
+                ))}
+                {sel && cells.length > 0 && (
+                  <div style={{ position: "absolute", left: g.offsetX + (o.ix + minA) * g.cellPx, top: g.offsetY + (o.iy + minB) * g.cellPx, width: (maxA - minA) * g.cellPx, height: (maxB - minB) * g.cellPx, border: "2px dashed rgba(255,255,255,0.85)", pointerEvents: "none", zIndex: 17 }} />
+                )}
+                <div onPointerDown={(e) => onTplPointerDown(e, t)} onPointerMove={onTplPointerMove} onPointerUp={onTplPointerUp} title="Spell origin — drag to move"
+                  style={{ position: "absolute", left: oxPx - dotR, top: oyPx - dotR, width: 2 * dotR, height: 2 * dotR, borderRadius: "50%", background: t.color, border: "1.5px solid #fff", cursor: "grab", touchAction: "none", zIndex: sel ? 19 : 12 }} />
+              </div>
+            );
+          })}
+
+          {/* token drag target highlight */}
+          {drag && dragCell && (
+            <div style={{ position: "absolute", left: g.offsetX + dragCell.gx * g.cellPx, top: g.offsetY + dragCell.gy * g.cellPx, width: drag.footprint * g.cellPx, height: drag.footprint * g.cellPx, border: `2px dashed ${C.gold}`, background: "rgba(212,175,55,0.12)", borderRadius: 4, pointerEvents: "none", zIndex: 18 }} />
+          )}
+
+          {/* tokens */}
+          {map.tokens.map((t) => {
+            const e = entityById.get(t.entityId);
+            if (!e) return null;
+            const sd = sizeOf(e);
+            const live = drag?.entityId === t.entityId && dragCell ? dragCell : t;
+            const box = sd.footprint * g.cellPx, dia = box * sd.scale;
+            const accent = e.color || (e.kind === "pc" ? C.pc : C.npc);
+            const isSel = selected === t.entityId;
+            const isActive = activeId === t.entityId;
+            const portrait = e.portraitAssetId ? assetById.get(e.portraitAssetId)?.storageRef ?? null : null;
+            const ring = isActive
+              ? `0 0 0 3px ${C.gold}, 0 0 12px rgba(212,175,55,0.85)`
+              : isSel ? `0 0 0 2px rgba(255,255,255,0.55)` : "0 1px 3px rgba(0,0,0,0.6)";
+            return (
+              <div key={t.entityId}
+                onPointerDown={(ev) => onTokenPointerDown(ev, t)} onPointerMove={onTokenPointerMove} onPointerUp={onTokenPointerUp}
+                onDoubleClick={(ev) => { ev.stopPropagation(); removeToken(t.entityId); }}
+                title={`${e.name} — drag to move, double-click to remove`}
+                style={{ position: "absolute", left: g.offsetX + live.gx * g.cellPx, top: g.offsetY + live.gy * g.cellPx, width: box, height: box, display: "flex", alignItems: "center", justifyContent: "center", cursor: "grab", zIndex: isActive ? 32 : isSel ? 30 : 20 }}>
+                <div style={{ width: dia, height: dia, borderRadius: "50%", overflow: "hidden", background: portrait ? "#0a0c11" : `${accent}cc`, border: `2px solid ${isActive ? C.gold : "#0a0c11"}`, boxShadow: ring, display: "flex", alignItems: "center", justifyContent: "center", color: "#0a0c11", fontWeight: 800, fontSize: Math.max(9, Math.min(16, dia * 0.4)) }}>
+                  {portrait
+                    ? <img src={portrait} alt="" draggable={false} style={{ width: "100%", height: "100%", objectFit: "cover", userSelect: "none" }} />
+                    : initials(e.name)}
+                </div>
+                {sd.scale >= 1 && (
+                  <span style={{ position: "absolute", top: box - 2, left: "50%", transform: "translateX(-50%)", whiteSpace: "nowrap", fontSize: 10, fontWeight: 700, color: C.text, background: "rgba(10,12,17,0.75)", padding: "0 4px", borderRadius: 3 }}>{e.name}</span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* drag distance readout */}
+        {dragDistanceLabel && (
+          <div style={{ position: "absolute", left: 10, bottom: 10, background: "rgba(10,12,17,0.85)", border: `1px solid ${C.border}`, color: C.gold, fontWeight: 800, fontSize: 13, padding: "4px 8px", borderRadius: 6, pointerEvents: "none" }}>{dragDistanceLabel}</div>
+        )}
+
+        {/* AoE editor */}
+        {selectedTpl && (
+          <div onPointerDown={(e) => e.stopPropagation()}
+            style={{ position: "absolute", top: 10, left: "50%", transform: "translateX(-50%)", zIndex: 55, background: C.panel, border: `1px solid ${C.border}`, borderRadius: 9, padding: "8px 10px", display: "flex", alignItems: "center", gap: 10, boxShadow: "0 8px 24px rgba(0,0,0,0.5)", flexWrap: "wrap", maxWidth: "92%" }}>
+            <span style={{ color: C.gold, fontWeight: 800, fontSize: 12, textTransform: "capitalize" }}>{selectedTpl.shape}</span>
+            <span style={label}>Size</span>
+            <input type="range" min={5} max={60} step={5} value={selectedTpl.sizeFt} onChange={(e) => updateTpl(selectedTpl.id, { sizeFt: Number(e.target.value) })} />
+            <span style={{ ...label, width: 44 }}>{formatDistance(selectedTpl.sizeFt, { unit: distanceUnit })}</span>
+            <span style={label}>Opacity</span>
+            <input type="range" min={0.1} max={0.6} step={0.02} value={selectedTpl.opacity} onChange={(e) => updateTpl(selectedTpl.id, { opacity: Number(e.target.value) })} />
+            <input type="color" value={toHex(selectedTpl.color)} onChange={(e) => updateTpl(selectedTpl.id, { color: e.target.value })} style={{ width: 30, height: 24, padding: 0, border: `1px solid ${C.border}`, background: "transparent" }} />
+            {selectedTpl.shape !== "burst" && (() => {
+              const curDeg = Math.round(selectedTpl.angleDeg ?? DIR_ANGLE[selectedTpl.dir ?? "E"]);
+              return (
+                <>
+                  <span style={label}>Aim</span>
+                  <input type="range" min={0} max={355} step={5} value={curDeg} onChange={(e) => updateTpl(selectedTpl.id, { angleDeg: Number(e.target.value) })} />
+                  <span style={{ ...label, width: 34 }}>{curDeg}°</span>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 22px)", gridTemplateRows: "repeat(3, 22px)", gap: 2 }}>
+                    {COMPASS.map((d, i) => d === null
+                      ? <div key={i} />
+                      : <button key={i} title={`${d} (${DIR_ANGLE[d]}°)`} onClick={() => updateTpl(selectedTpl.id, { angleDeg: DIR_ANGLE[d], dir: d })}
+                          style={{ background: curDeg === DIR_ANGLE[d] ? C.gold : C.row, color: curDeg === DIR_ANGLE[d] ? "#0a0c11" : C.text, border: `1px solid ${C.border}`, borderRadius: 4, cursor: "pointer", fontWeight: 800, fontSize: 12, padding: 0 }}>{DIR_ARROW[d]}</button>)}
+                  </div>
+                </>
+              );
+            })()}
+            <button style={{ ...btn("#fff"), background: "#d9544a", border: "1px solid #d9544a" }} onClick={() => removeTpl(selectedTpl.id)}>Delete</button>
+          </div>
+        )}
+      </div>
+
+      <p style={{ fontSize: 11, color: C.dim, marginTop: 6 }}>
+        Drag canvas to pan, scroll to zoom, drag tokens to move (snaps to grid; distance bottom-left). Double-click a token or AoE to remove it.
+        Add an area template, then drag its origin dot (snaps to grid intersections) and tune it in the floating editor. Reach + AoE geometry come from the <strong>{ruleset.meta.name}</strong> ruleset.
+      </p>
+    </div>
+  );
+}
+
+/** Accept a hex or rgba() grid color; return a hex for <input type=color>. */
+function toHex(color: string): string {
+  if (color.startsWith("#")) return color.slice(0, 7);
+  const m = color.match(/rgba?\(([^)]+)\)/);
+  if (!m) return "#d4af37";
+  const [r, gg, b] = m[1].split(",").map((s) => parseInt(s.trim(), 10));
+  const h = (n: number) => clamp(n || 0, 0, 255).toString(16).padStart(2, "0");
+  return `#${h(r)}${h(gg)}${h(b)}`;
+}
