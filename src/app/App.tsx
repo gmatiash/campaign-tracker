@@ -28,6 +28,55 @@ const cloud = isSupabaseConfigured && !!supabase;
 const repo: Repository = cloud && supabase ? new SupabaseRepository(supabase) : new IndexedDbRepository();
 const demoRuleset = getRuleset(DEMO_RULESET_ID);
 
+// Build the demo content. Fixed ids, so re-running overwrites/restores cleanly.
+async function seedDemo(ownerId: Id): Promise<void> {
+  const now = Date.now();
+  const campaign: Campaign = {
+    collection: "campaigns", id: CAMPAIGN_ID, campaignId: CAMPAIGN_ID, ownerId,
+    visibility: { kind: "party" }, createdAt: now, updatedAt: now, schemaVersion: 1,
+    name: "Demo Campaign", rulesetId: DEMO_RULESET_ID,
+    members: [{ userId: ownerId, role: "gm", displayName: "GM" }],
+  };
+  await repo.put("campaigns", campaign);
+  const mk = (id: Id, name: string, kind: "pc" | "npc", sizeId: string, initiativeMod: number) =>
+    createEntity({ campaignId: CAMPAIGN_ID, ownerId, ruleset: demoRuleset, id, name, kind, sizeId, initiativeMod });
+  await repo.put("entities", mk("e-pc", "Mira Voss", "pc", "medium", 3));
+  await repo.put("entities", mk("e-n1", "Raider 1", "npc", "small", 1));
+  await repo.put("entities", mk("e-n2", "Raider 2", "npc", "small", 1));
+
+  const map: MapDoc = {
+    collection: "maps", id: MAP_ID, campaignId: CAMPAIGN_ID, ownerId,
+    visibility: { kind: "party" }, createdAt: now, updatedAt: now, schemaVersion: 1,
+    name: "Demo Map", width: 1600, height: 900,
+    grid: { kind: demoRuleset.grid.kind, cellPx: 50, cellFt: demoRuleset.grid.cellFt, offsetX: 0, offsetY: 0, color: "rgba(212,175,55,0.35)" },
+    tokens: [
+      { entityId: "e-pc", gx: 3, gy: 3 },
+      { entityId: "e-n1", gx: 6, gy: 4 },
+      { entityId: "e-n2", gx: 7, gy: 4 },
+    ],
+    aoeTemplates: [], walls: [], fog: { enabled: false, revealed: [] },
+  };
+  await repo.put("maps", map);
+
+  const scene: Scene = {
+    collection: "scenes", id: SCENE_ID, campaignId: CAMPAIGN_ID, ownerId,
+    visibility: { kind: "party" }, createdAt: now, updatedAt: now, schemaVersion: 1,
+    name: "Encounter", mapId: MAP_ID, participantEntityIds: [], round: 1,
+  };
+  await repo.put("scenes", scene);
+}
+
+const WIPE_COLLECTIONS = ["entities", "maps", "scenes", "assets", "notes"] as const;
+
+// Delete the campaign's working data and re-seed the demo.
+async function resetToDemo(ownerId: Id): Promise<void> {
+  for (const c of WIPE_COLLECTIONS) {
+    const recs = await repo.list(c, { campaignId: CAMPAIGN_ID });
+    for (const r of recs) await repo.remove(c, r.id);
+  }
+  await seedDemo(ownerId);
+}
+
 // Seed demo content once per owner, and never clobber existing data. In cloud
 // mode the first member to join becomes GM and seeds; later members just read.
 let bootstrappedFor = "";
@@ -40,38 +89,12 @@ async function bootstrap(ownerId: Id): Promise<void> {
     if (error) console.error("ensure_membership failed", error);
   }
 
-  const now = Date.now();
   try {
     if (!(await repo.get("campaigns", CAMPAIGN_ID))) {
-      const campaign: Campaign = {
-        collection: "campaigns", id: CAMPAIGN_ID, campaignId: CAMPAIGN_ID, ownerId,
-        visibility: { kind: "party" }, createdAt: now, updatedAt: now, schemaVersion: 1,
-        name: "Demo Campaign", rulesetId: DEMO_RULESET_ID,
-        members: [{ userId: ownerId, role: "gm", displayName: "GM" }],
-      };
-      await repo.put("campaigns", campaign);
-      const mk = (id: Id, name: string, kind: "pc" | "npc", sizeId: string, initiativeMod: number) =>
-        createEntity({ campaignId: CAMPAIGN_ID, ownerId, ruleset: demoRuleset, id, name, kind, sizeId, initiativeMod });
-      await repo.put("entities", mk("e-pc", "Mira Voss", "pc", "medium", 3));
-      await repo.put("entities", mk("e-n1", "Raider 1", "npc", "small", 1));
-      await repo.put("entities", mk("e-n2", "Raider 2", "npc", "small", 1));
-
-      const map: MapDoc = {
-        collection: "maps", id: MAP_ID, campaignId: CAMPAIGN_ID, ownerId,
-        visibility: { kind: "party" }, createdAt: now, updatedAt: now, schemaVersion: 1,
-        name: "Demo Map", width: 1600, height: 900,
-        grid: { kind: demoRuleset.grid.kind, cellPx: 50, cellFt: demoRuleset.grid.cellFt, offsetX: 0, offsetY: 0, color: "rgba(212,175,55,0.35)" },
-        tokens: [
-          { entityId: "e-pc", gx: 3, gy: 3 },
-          { entityId: "e-n1", gx: 6, gy: 4 },
-          { entityId: "e-n2", gx: 7, gy: 4 },
-        ],
-        aoeTemplates: [], walls: [], fog: { enabled: false, revealed: [] },
-      };
-      await repo.put("maps", map);
-    }
-
-    if (!(await repo.get("scenes", SCENE_ID))) {
+      await seedDemo(ownerId);
+    } else if (!(await repo.get("scenes", SCENE_ID))) {
+      // Older installs created before scenes existed.
+      const now = Date.now();
       const scene: Scene = {
         collection: "scenes", id: SCENE_ID, campaignId: CAMPAIGN_ID, ownerId,
         visibility: { kind: "party" }, createdAt: now, updatedAt: now, schemaVersion: 1,
@@ -108,6 +131,18 @@ function MainApp({ ownerId, userLabel, onSignOut }: { ownerId: Id; userLabel?: s
       console.error(err);
     }
   };
+  const onReset = async () => {
+    const msg = cloud
+      ? "Reset the shared campaign to the demo for EVERYONE? This deletes all current combatants, maps, scenes and uploaded images."
+      : "Reset to the demo? This clears your local combatants, maps, scenes and uploaded images.";
+    if (!window.confirm(msg)) return;
+    if (cloud && supabase) {
+      const { data } = await supabase.from("campaign_members").select("role").eq("campaign_id", CAMPAIGN_ID).eq("user_id", ownerId).maybeSingle();
+      if (data?.role !== "gm") { alert("Only the GM can reset the campaign."); return; }
+    }
+    try { await resetToDemo(ownerId); }
+    catch (err) { alert("Reset failed."); console.error(err); }
+  };
 
   return (
     <div style={{ minHeight: "100vh", background: "#0a0c11", color: "#e9e3d4", fontFamily: "system-ui, sans-serif", padding: 20 }}>
@@ -123,6 +158,7 @@ function MainApp({ ownerId, userLabel, onSignOut }: { ownerId: Id; userLabel?: s
           <input ref={fileRef} type="file" accept="application/json,.json" style={{ display: "none" }}
             onChange={(e) => { const f = e.target.files?.[0]; if (f) onImportFile(f); e.target.value = ""; }} />
         </label>
+        <button style={{ ...btnStyle, color: "#d9544a" }} onClick={onReset}>Reset to demo</button>
         {onSignOut && <button style={btnStyle} onClick={onSignOut}>Sign out</button>}
       </div>
       <p style={{ fontSize: 12, color: "#99a0b0", maxWidth: 700 }}>

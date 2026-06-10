@@ -1,7 +1,7 @@
 // src/modules/combat/CombatTracker.tsx
 import { useEffect, useMemo, useState } from "react";
 import type { Entity, Id, Scene } from "../../core/domain/domain";
-import type { Asset } from "../../core/domain/map";
+import type { Asset, MapDoc } from "../../core/domain/map";
 import { cloneEntity, createEntity } from "../../core/domain/factory";
 import { fileToImageAsset } from "../../core/assets";
 import type { Repository } from "../../core/persistence/repository";
@@ -78,8 +78,16 @@ export default function CombatTracker({ repo, ruleset, campaignId, sceneId, owne
     }
     repo.put("entities", cloneEntity(src, `${base} ${max + 1}`));
   };
-  const removeEntity = (e: Entity) => {
-    if (window.confirm(`Remove ${e.name} from the campaign?`)) repo.remove("entities", e.id);
+  const removeEntity = async (e: Entity) => {
+    if (!window.confirm(`Remove ${e.name} from the campaign?`)) return;
+    await repo.remove("entities", e.id);
+    // Prune any map token placements that referenced this entity.
+    const maps = await repo.list<MapDoc>("maps", { campaignId });
+    for (const m of maps) {
+      if (m.tokens.some((t) => t.entityId === e.id)) {
+        await repo.put<MapDoc>("maps", { ...m, tokens: m.tokens.filter((t) => t.entityId !== e.id) });
+      }
+    }
   };
   const uploadPortrait = async (e: Entity, file: File) => {
     try {
