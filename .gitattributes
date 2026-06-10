@@ -1,0 +1,13 @@
+# Normalize line endings. Store and check out text files as LF on all platforms,
+# which keeps diffs clean and stops the "LF will be replaced by CRLF" warnings.
+* text=auto eol=lf
+
+# Treat common binary types as binary (no end-of-line conversion), for when you
+# add images or other assets to the repo later.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.ico  binary
+*.pdf  binary
