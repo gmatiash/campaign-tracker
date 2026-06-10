@@ -30,8 +30,8 @@ export interface AoeTemplate {
   color: string;
   opacity: number;
   effect?: {
-    // [future] spell visuals — cosmetic only
-    kind: "fire" | "ice" | "mud" | "fog" | "acid" | "custom";
+    // spell/terrain visuals — cosmetic only
+    kind: "fire" | "ice" | "mud" | "fog" | "water" | "acid" | "custom";
     assetId?: Id;
     animated?: boolean;
   };

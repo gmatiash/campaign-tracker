@@ -1,8 +1,9 @@
 // src/modules/map/MapView.tsx
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, PointerEvent as RPointerEvent, WheelEvent as RWheelEvent } from "react";
-import type { Entity, Id, Scene } from "../../core/domain/domain";
+import type { Campaign, Entity, Id, Scene } from "../../core/domain/domain";
 import { fileToImageAsset, removeImage } from "../../core/assets";
+import { detectGrid } from "../../core/gridDetect";
 import type { AoeTemplate, Asset, GridConfig, MapDoc, Wall } from "../../core/domain/map";
 import type { Repository } from "../../core/persistence/repository";
 import type { AoeShape, Dir8, Ruleset } from "../../core/ruleset/ruleset";
@@ -24,6 +25,29 @@ function hexToRgba(hex: string, a: number): string {
   if (h.length === 3) h = h.split("").map((c) => c + c).join("");
   const n = parseInt(h, 16);
   return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
+}
+
+// Preset AoE/terrain visuals — a CSS background per cell, tinted at the template's opacity.
+type EffectKind = "fire" | "ice" | "mud" | "fog" | "water" | "acid" | "custom";
+const EFFECT_PRESETS: Array<{ kind: Exclude<EffectKind, "custom">; label: string }> = [
+  { kind: "fire", label: "Fire" },
+  { kind: "water", label: "Water" },
+  { kind: "mud", label: "Mud" },
+  { kind: "fog", label: "Mist" },
+  { kind: "ice", label: "Ice" },
+  { kind: "acid", label: "Acid" },
+];
+function effectFill(kind: EffectKind, opacity: number): string {
+  const a = Math.min(0.95, opacity + 0.15); // a touch stronger than a flat tint so it reads
+  switch (kind) {
+    case "fire": return `radial-gradient(circle at 50% 70%, rgba(255,196,72,${a}), rgba(214,64,18,${a}))`;
+    case "water": return `rgba(46,118,206,${a})`;
+    case "mud": return `rgba(104,76,44,${a})`;
+    case "fog": return `rgba(222,228,236,${a})`;
+    case "ice": return `linear-gradient(135deg, rgba(190,228,255,${a}), rgba(120,178,236,${a}))`;
+    case "acid": return `rgba(126,200,64,${a})`;
+    default: return `rgba(120,120,120,${a})`;
+  }
 }
 
 const DIR_ARROW: Record<Dir8, string> = { N: "\u2191", NE: "\u2197", E: "\u2192", SE: "\u2198", S: "\u2193", SW: "\u2199", W: "\u2190", NW: "\u2196" };
@@ -97,9 +121,11 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
   const [entities, setEntities] = useState<Entity[]>([]);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [scenes, setScenes] = useState<Scene[]>([]);
+  const [campaigns, setCampaigns] = useState<Campaign[]>([]);
   const [view, setView] = useState<View>({ scale: 1, tx: 0, ty: 0 });
   const [drag, setDrag] = useState<DragState | null>(null);
   const [dragCell, setDragCell] = useState<{ gx: number; gy: number } | null>(null);
+  const [dragPath, setDragPath] = useState<{ cells: Array<[number, number]>; blocked: boolean } | null>(null);
   const [selected, setSelected] = useState<Id | null>(null);
   const [selTpl, setSelTpl] = useState<Id | null>(null);
   const [tplDrag, setTplDrag] = useState<TplDrag | null>(null);
@@ -119,11 +145,14 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
   useEffect(() => repo.subscribe<Entity>("entities", { campaignId }, setEntities), [repo, campaignId]);
   useEffect(() => repo.subscribe<Asset>("assets", { campaignId }, setAssets), [repo, campaignId]);
   useEffect(() => repo.subscribe<Scene>("scenes", { campaignId }, setScenes), [repo, campaignId]);
+  useEffect(() => repo.subscribe<Campaign>("campaigns", { campaignId }, setCampaigns), [repo, campaignId]);
 
   const map = useMemo(() => maps.find((m) => m.id === mapId) ?? null, [maps, mapId]);
   const entityById = useMemo(() => new Map(entities.map((e) => [e.id, e] as const)), [entities]);
   const assetById = useMemo(() => new Map(assets.map((a) => [a.id, a] as const)), [assets]);
   const activeId = useMemo(() => scenes.find((s) => s.id === sceneId)?.activeEntityId ?? null, [scenes, sceneId]);
+  const campaign = useMemo(() => campaigns.find((c) => c.id === campaignId) ?? null, [campaigns, campaignId]);
+  const unit: DistanceUnit = campaign?.settings?.distanceUnit ?? distanceUnit;
   const bgSrc = useMemo(() => {
     if (!map?.backgroundAssetId) return null;
     return assetById.get(map.backgroundAssetId)?.storageRef ?? null;
@@ -139,6 +168,7 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
     repo.put<MapDoc>("maps", { ...map, ...patch, updatedAt: Date.now() });
   };
   const setGrid = (patch: Partial<GridConfig>) => map && saveMap({ grid: { ...map.grid, ...patch } });
+  const saveUnit = (u: DistanceUnit) => { if (campaign) repo.put<Campaign>("campaigns", { ...campaign, settings: { ...campaign.settings, distanceUnit: u }, updatedAt: Date.now() }); };
   const moveToken = (entityId: Id, gx: number, gy: number) =>
     map && saveMap({ tokens: map.tokens.map((t) => (t.entityId === entityId ? { ...t, gx, gy } : t)) });
   const removeToken = (entityId: Id) =>
@@ -172,14 +202,49 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
     map && saveMap({ aoeTemplates: map.aoeTemplates.map((t) => (t.id === id ? { ...t, ...patch } : t)) });
   const removeTpl = (id: Id) => { if (map) saveMap({ aoeTemplates: map.aoeTemplates.filter((t) => t.id !== id) }); setSelTpl(null); };
 
+  // Set a template's effect (preset or none), cleaning up a replaced custom image.
+  const setTplEffect = async (t: AoeTemplate, effect: AoeTemplate["effect"]) => {
+    updateTpl(t.id, { effect });
+    const prev = t.effect;
+    if (prev?.kind === "custom" && prev.assetId && effect?.kind !== "custom") {
+      await removeImage(await repo.get<Asset>("assets", prev.assetId));
+      await repo.remove("assets", prev.assetId).catch(() => undefined);
+    }
+  };
+  // Upload a custom image to tile (semi-transparently) across the affected cells.
+  const uploadEffectImage = async (t: AoeTemplate, file: File) => {
+    if (!map) return;
+    try {
+      const prev = t.effect;
+      const asset = await fileToImageAsset(file, campaignId, map.ownerId);
+      await repo.put<Asset>("assets", asset);
+      updateTpl(t.id, { effect: { kind: "custom", assetId: asset.id } });
+      if (prev?.kind === "custom" && prev.assetId) {
+        await removeImage(await repo.get<Asset>("assets", prev.assetId));
+        await repo.remove("assets", prev.assetId).catch(() => undefined);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
   // ---- background upload ---------------------------------------------------
   const loadImageFile = async (file: File) => {
     if (!map) return;
     try {
       const prevId = map.backgroundAssetId;
       const asset = await fileToImageAsset(file, campaignId, map.ownerId);
+      const guess = await detectGrid(file).catch(() => null);
+      const gridPatch = (() => {
+        if (!guess) return {};
+        const cell = clamp(Math.round(guess.cellPx), 16, 200);
+        const wrap = (v: number) => ((Math.round(v) % cell) + cell) % cell;
+        return { cellPx: cell, offsetX: wrap(guess.offsetX), offsetY: wrap(guess.offsetY) };
+      })();
+      if (guess) console.info(`[grid] auto-detected cell ≈ ${Math.round(guess.cellPx)}px (confidence ${guess.confidence.toFixed(2)}). Fine-tune with the Cell / Off sliders if needed.`);
+      else console.info("[grid] no clear grid found in the image — set the cell size manually with the sliders.");
       await repo.put<Asset>("assets", asset);
-      saveMap({ backgroundAssetId: asset.id, width: asset.width, height: asset.height });
+      saveMap({ backgroundAssetId: asset.id, width: asset.width, height: asset.height, grid: { ...map.grid, ...gridPatch } });
       if (prevId) {
         await removeImage(await repo.get<Asset>("assets", prevId));
         await repo.remove("assets", prevId).catch(() => undefined);
@@ -252,6 +317,72 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
     }
     return s;
   }, [map?.walls]);
+
+  // Edges that block MOVEMENT: walls, but not doors (you can walk through a door).
+  const moveBlocked = useMemo(() => {
+    const s = new Set<string>();
+    for (const w of map?.walls ?? []) {
+      if (w.door) continue;
+      for (let i = 0; i + 1 < w.points.length; i++) { const k = wallEdge(w.points[i], w.points[i + 1]); if (k) s.add(k); }
+    }
+    return s;
+  }, [map?.walls]);
+
+  const PATH_LIMIT = 4000; // skip pathfinding on very large grids (perf)
+  const stepAllowed = (x: number, y: number, nx: number, ny: number): boolean => {
+    const dx = nx - x, dy = ny - y;
+    if (dx && dy) {
+      const v = dx > 0 ? `V:${x + 1}:${y}` : `V:${x}:${y}`;
+      const h = dy > 0 ? `H:${x}:${y + 1}` : `H:${x}:${y}`;
+      return !moveBlocked.has(v) && !moveBlocked.has(h); // no cutting wall corners
+    }
+    if (dx) return !moveBlocked.has(dx > 0 ? `V:${x + 1}:${y}` : `V:${x}:${y}`);
+    return !moveBlocked.has(dy > 0 ? `H:${x}:${y + 1}` : `H:${x}:${y}`);
+  };
+  // Shortest grid path that never crosses a wall (doors pass). Dijkstra, 8-way,
+  // orthogonal cost 10 / diagonal 14. Returns cells start..target, or null.
+  const findPath = (sx: number, sy: number, tx: number, ty: number, cols: number, rows: number): Array<[number, number]> | null => {
+    if (sx === tx && sy === ty) return [[sx, sy]];
+    const N = cols * rows, idx = (x: number, y: number) => y * cols + x;
+    const dist = new Float64Array(N).fill(Infinity);
+    const prev = new Int32Array(N).fill(-1);
+    const done = new Uint8Array(N);
+    const heap: number[] = [];
+    const up = (i: number) => { while (i > 0) { const p = (i - 1) >> 1; if (dist[heap[p]] <= dist[heap[i]]) break; [heap[p], heap[i]] = [heap[i], heap[p]]; i = p; } };
+    const down = (i: number) => { for (;;) { const l = 2 * i + 1, r = 2 * i + 2; let m = i; if (l < heap.length && dist[heap[l]] < dist[heap[m]]) m = l; if (r < heap.length && dist[heap[r]] < dist[heap[m]]) m = r; if (m === i) break; [heap[m], heap[i]] = [heap[i], heap[m]]; i = m; } };
+    const push = (n: number) => { heap.push(n); up(heap.length - 1); };
+    const pop = () => { const top = heap[0], last = heap.pop()!; if (heap.length) { heap[0] = last; down(0); } return top; };
+    const target = idx(tx, ty);
+    dist[idx(sx, sy)] = 0; push(idx(sx, sy));
+    const DIRS = [[1, 0, 10], [-1, 0, 10], [0, 1, 10], [0, -1, 10], [1, 1, 14], [1, -1, 14], [-1, 1, 14], [-1, -1, 14]];
+    while (heap.length) {
+      const u = pop();
+      if (done[u]) continue;
+      done[u] = 1;
+      if (u === target) break;
+      const ux = u % cols, uy = (u / cols) | 0, du = dist[u];
+      for (const [dx, dy, w] of DIRS) {
+        const nx = ux + dx, ny = uy + dy;
+        if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+        if (!stepAllowed(ux, uy, nx, ny)) continue;
+        const v = idx(nx, ny), nd = du + w;
+        if (nd < dist[v]) { dist[v] = nd; prev[v] = u; push(v); }
+      }
+    }
+    if (dist[target] === Infinity) return null;
+    const path: Array<[number, number]> = [];
+    for (let cur = target; cur !== -1; cur = prev[cur]) path.push([cur % cols, (cur / cols) | 0]);
+    return path.reverse();
+  };
+  // 3.5e distance along a path (orthogonal = 1 square; diagonals alternate 1,2,…).
+  const pathDistanceFt = (cells: Array<[number, number]>, cellFt: number): number => {
+    let orth = 0, diag = 0;
+    for (let i = 1; i < cells.length; i++) {
+      const dx = Math.abs(cells[i][0] - cells[i - 1][0]), dy = Math.abs(cells[i][1] - cells[i - 1][1]);
+      if (dx && dy) diag++; else orth++;
+    }
+    return (orth + diag + Math.floor(diag / 2)) * cellFt;
+  };
 
   const toWorld = (clientX: number, clientY: number) => {
     const vp = viewportRef.current?.getBoundingClientRect();
@@ -412,14 +543,19 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
     const dCellX = Math.round((e.clientX - drag.startX) / drag.startScale / map.grid.cellPx);
     const dCellY = Math.round((e.clientY - drag.startY) / drag.startScale / map.grid.cellPx);
     const cols = Math.floor(map.width / map.grid.cellPx), rows = Math.floor(map.height / map.grid.cellPx);
-    setDragCell({
-      gx: clamp(drag.baseGx + dCellX, 0, Math.max(0, cols - drag.footprint)),
-      gy: clamp(drag.baseGy + dCellY, 0, Math.max(0, rows - drag.footprint)),
-    });
+    const gx = clamp(drag.baseGx + dCellX, 0, Math.max(0, cols - drag.footprint));
+    const gy = clamp(drag.baseGy + dCellY, 0, Math.max(0, rows - drag.footprint));
+    setDragCell({ gx, gy });
+    if (moveBlocked.size > 0 && cols * rows <= PATH_LIMIT) {
+      const path = findPath(drag.baseGx, drag.baseGy, gx, gy, cols, rows);
+      setDragPath(path ? { cells: path, blocked: false } : { cells: [[drag.baseGx, drag.baseGy], [gx, gy]], blocked: true });
+    } else {
+      setDragPath(null); // no walls (or grid too large) → straight-line, unconstrained
+    }
   };
   const onTokenPointerUp = () => {
-    if (drag && dragCell) moveToken(drag.entityId, dragCell.gx, dragCell.gy);
-    setDrag(null); setDragCell(null);
+    if (drag && dragCell && !(dragPath?.blocked)) moveToken(drag.entityId, dragCell.gx, dragCell.gy);
+    setDrag(null); setDragCell(null); setDragPath(null);
   };
 
   // ---- template drag (snap origin to intersections) ------------------------
@@ -442,10 +578,13 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
   };
 
   const dragDistanceLabel = useMemo(() => {
-    if (!drag || !dragCell) return null;
-    const ft = ruleset.measureDistanceFt({ x: drag.baseGx, y: drag.baseGy }, { x: dragCell.gx, y: dragCell.gy });
-    return formatDistance(ft, { unit: distanceUnit });
-  }, [drag, dragCell, ruleset, distanceUnit]);
+    if (!drag || !dragCell || !map) return null;
+    if (dragPath?.blocked) return "✕ blocked by a wall";
+    const ft = dragPath
+      ? pathDistanceFt(dragPath.cells, map.grid.cellFt)
+      : ruleset.measureDistanceFt({ x: drag.baseGx, y: drag.baseGy }, { x: dragCell.gx, y: dragCell.gy });
+    return formatDistance(ft, { unit });
+  }, [drag, dragCell, dragPath, map, ruleset, unit]);
 
   // ---- styles --------------------------------------------------------------
   const btn = (color: string, on = false): CSSProperties => ({
@@ -477,7 +616,7 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
             onChange={(e) => { const f = e.target.files?.[0]; if (f) loadImageFile(f); e.target.value = ""; }} />
         </label>
         <span style={label}>Cell</span>
-        <input type="range" min={24} max={96} value={g.cellPx} onChange={(e) => setGrid({ cellPx: Number(e.target.value) })} />
+        <input type="range" min={16} max={200} value={g.cellPx} onChange={(e) => setGrid({ cellPx: Number(e.target.value) })} />
         <span style={{ ...label, width: 36 }}>{g.cellPx}px</span>
         <span style={label}>Color</span>
         <input type="color" value={toHex(g.color)} onChange={(e) => setGrid({ color: e.target.value })} style={{ width: 30, height: 24, padding: 0, border: `1px solid ${C.border}`, background: "transparent" }} />
@@ -486,6 +625,8 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
         <span style={label}>Y</span>
         <input type="range" min={0} max={g.cellPx} value={g.offsetY} onChange={(e) => setGrid({ offsetY: Number(e.target.value) })} />
         <div style={{ flex: 1 }} />
+        <span style={label}>Units</span>
+        <button style={btn(C.text)} title="Switch distance units (shared by the campaign)" onClick={() => saveUnit(unit === "ft" ? "m" : "ft")}>{unit}</button>
         <button style={btn(C.text)} onClick={() => setView((v) => ({ ...v, scale: clamp(v.scale / 1.1, 0.2, 6) }))}>−</button>
         <button style={btn(C.gold)} onClick={fit}>Fit</button>
         <button style={btn(C.text)} onClick={() => setView((v) => ({ ...v, scale: clamp(v.scale * 1.1, 0.2, 6) }))}>+</button>
@@ -577,7 +718,8 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
             const cells = ruleset.aoeCells?.({ shape: t.shape, sizeFt: t.sizeFt, dir: t.dir, angleDeg: t.angleDeg, cellFt: g.cellFt }) ?? [];
             const o = tplDrag?.id === t.id && tplOrigin ? tplOrigin : { ix: t.originIX, iy: t.originIY };
             const sel = selTpl === t.id;
-            const fill = hexToRgba(t.color, t.opacity);
+            const effImg = t.effect?.kind === "custom" && t.effect.assetId ? assetById.get(t.effect.assetId)?.storageRef ?? null : null;
+            const fill = effImg ? "transparent" : t.effect?.kind ? effectFill(t.effect.kind, t.opacity) : hexToRgba(t.color, t.opacity);
             const edge = hexToRgba(t.color, Math.min(1, t.opacity + 0.35));
             const oxPx = g.offsetX + o.ix * g.cellPx, oyPx = g.offsetY + o.iy * g.cellPx;
             let minA = 0, minB = 0, maxA = 0, maxB = 0;
@@ -589,7 +731,9 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
                   <div key={`${t.id}-${c.x}-${c.y}`}
                     onPointerDown={(e) => onTplPointerDown(e, t)} onPointerMove={onTplPointerMove} onPointerUp={onTplPointerUp}
                     onDoubleClick={(e) => { e.stopPropagation(); removeTpl(t.id); }}
-                    style={{ position: "absolute", left: g.offsetX + (o.ix + c.x) * g.cellPx, top: g.offsetY + (o.iy + c.y) * g.cellPx, width: g.cellPx, height: g.cellPx, background: fill, border: `1px solid ${edge}`, cursor: "grab", touchAction: "none", zIndex: sel ? 16 : 10 }} />
+                    style={{ position: "absolute", left: g.offsetX + (o.ix + c.x) * g.cellPx, top: g.offsetY + (o.iy + c.y) * g.cellPx, width: g.cellPx, height: g.cellPx, background: fill, border: `1px solid ${edge}`, overflow: "hidden", cursor: "grab", touchAction: "none", zIndex: sel ? 16 : 10 }}>
+                    {effImg && <img src={effImg} alt="" draggable={false} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover", opacity: t.opacity, pointerEvents: "none" }} />}
+                  </div>
                 ))}
                 {sel && cells.length > 0 && (
                   <div style={{ position: "absolute", left: g.offsetX + (o.ix + minA) * g.cellPx, top: g.offsetY + (o.iy + minB) * g.cellPx, width: (maxA - minA) * g.cellPx, height: (maxB - minB) * g.cellPx, border: "2px dashed rgba(255,255,255,0.85)", pointerEvents: "none", zIndex: 17 }} />
@@ -604,6 +748,20 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
           {drag && dragCell && (
             <div style={{ position: "absolute", left: g.offsetX + dragCell.gx * g.cellPx, top: g.offsetY + dragCell.gy * g.cellPx, width: drag.footprint * g.cellPx, height: drag.footprint * g.cellPx, border: `2px dashed ${C.gold}`, background: "rgba(212,175,55,0.12)", borderRadius: 4, pointerEvents: "none", zIndex: 18 }} />
           )}
+
+          {/* movement path trace (around walls; red if blocked) */}
+          {drag && dragPath && (() => {
+            const col = dragPath.blocked ? C.danger : C.gold;
+            const cx = (x: number) => g.offsetX + (x + 0.5) * g.cellPx, cy = (y: number) => g.offsetY + (y + 0.5) * g.cellPx;
+            const pts = dragPath.cells.map(([x, y]) => `${cx(x)},${cy(y)}`).join(" ");
+            const r = Math.max(2, g.cellPx * 0.09);
+            return (
+              <svg width={map.width} height={map.height} style={{ position: "absolute", left: 0, top: 0, pointerEvents: "none", zIndex: 19 }}>
+                <polyline points={pts} fill="none" stroke={col} strokeWidth={3} strokeLinejoin="round" strokeLinecap="round" strokeDasharray={dragPath.blocked ? "9 6" : undefined} opacity={0.95} />
+                {dragPath.cells.map(([x, y], i) => <circle key={i} cx={cx(x)} cy={cy(y)} r={r} fill={col} />)}
+              </svg>
+            );
+          })()}
 
           {/* tokens (with same-cell stacking, condition icons and damage) */}
           {(() => {
@@ -759,7 +917,22 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
             <span style={{ color: C.gold, fontWeight: 800, fontSize: 12, textTransform: "capitalize" }}>{selectedTpl.shape}</span>
             <span style={label}>Size</span>
             <input type="range" min={5} max={60} step={5} value={selectedTpl.sizeFt} onChange={(e) => updateTpl(selectedTpl.id, { sizeFt: Number(e.target.value) })} />
-            <span style={{ ...label, width: 44 }}>{formatDistance(selectedTpl.sizeFt, { unit: distanceUnit })}</span>
+            <span style={{ ...label, width: 44 }}>{formatDistance(selectedTpl.sizeFt, { unit })}</span>
+            <span style={label}>Effect</span>
+            <select
+              value={selectedTpl.effect?.kind === "custom" ? "custom" : selectedTpl.effect?.kind ?? "none"}
+              onChange={(e) => { const v = e.target.value; if (v === "custom") return; setTplEffect(selectedTpl, v === "none" ? undefined : { kind: v as Exclude<EffectKind, "custom"> }); }}
+              style={{ background: C.row, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6, padding: "4px 6px", fontSize: 12 }}
+            >
+              <option value="none">None (tint)</option>
+              {EFFECT_PRESETS.map((p) => <option key={p.kind} value={p.kind}>{p.label}</option>)}
+              {selectedTpl.effect?.kind === "custom" && <option value="custom">Custom image</option>}
+            </select>
+            <label style={btn(C.text)} title="Upload an image to tile over the affected cells (semi-transparent)">
+              Img
+              <input type="file" accept="image/*" style={{ display: "none" }}
+                onChange={(e) => { const f = e.target.files?.[0]; if (f) uploadEffectImage(selectedTpl, f); e.target.value = ""; }} />
+            </label>
             <span style={label}>Opacity</span>
             <input type="range" min={0.1} max={0.6} step={0.02} value={selectedTpl.opacity} onChange={(e) => updateTpl(selectedTpl.id, { opacity: Number(e.target.value) })} />
             <input type="color" value={toHex(selectedTpl.color)} onChange={(e) => updateTpl(selectedTpl.id, { color: e.target.value })} style={{ width: 30, height: 24, padding: 0, border: `1px solid ${C.border}`, background: "transparent" }} />
