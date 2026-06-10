@@ -2,7 +2,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, PointerEvent as RPointerEvent, WheelEvent as RWheelEvent } from "react";
 import type { Entity, Id, Scene } from "../../core/domain/domain";
-import { createEntity } from "../../core/domain/factory";
 import { fileToImageAsset } from "../../core/assets";
 import type { AoeTemplate, Asset, GridConfig, MapDoc } from "../../core/domain/map";
 import type { Repository } from "../../core/persistence/repository";
@@ -12,7 +11,7 @@ import { formatDistance } from "../../core/units";
 
 const C = {
   bg: "#0a0c11", panel: "#13161f", row: "#1a1e29", border: "#2b3142",
-  text: "#e9e3d4", dim: "#99a0b0", gold: "#d4af37", pc: "#5b8def", npc: "#e07a3c",
+  text: "#e9e3d4", dim: "#99a0b0", gold: "#d4af37", pc: "#5b8def", npc: "#e07a3c", danger: "#d9544a",
 };
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
@@ -31,6 +30,48 @@ const DIR_ARROW: Record<Dir8, string> = { N: "\u2191", NE: "\u2197", E: "\u2192"
 const DIR_ANGLE: Record<Dir8, number> = { E: 0, SE: 45, S: 90, SW: 135, W: 180, NW: 225, N: 270, NE: 315 };
 const COMPASS: (Dir8 | null)[] = ["NW", "N", "NE", "W", null, "E", "SW", "S", "SE"];
 
+interface PlacedToken { entityId: Id; gx: number; gy: number; footprint: number; spaceFt: number; scale: number; }
+interface Placement { dx: number; dy: number; z: number; }
+
+/**
+ * Resolve how tokens sharing a cell are drawn:
+ *  - larger creatures sit on a LOWER layer than smaller ones (smaller render on top);
+ *  - sub-Small creatures (scale < 1) pack into their size's sub-grid (Tiny 2x2,
+ *    Diminutive 5x5, Fine 10x10) so several fit one square;
+ *  - same-square Small+ tokens fan diagonally so each stays partly visible.
+ */
+function computePlacements(items: PlacedToken[], cellPx: number): Map<string, Placement> {
+  const byCell = new Map<string, PlacedToken[]>();
+  for (const it of items) {
+    const k = `${it.gx},${it.gy}`;
+    const arr = byCell.get(k);
+    if (arr) arr.push(it); else byCell.set(k, [it]);
+  }
+  const out = new Map<string, Placement>();
+  for (const group of byCell.values()) {
+    const sorted = [...group].sort((a, b) => b.spaceFt - a.spaceFt); // largest first → lowest z
+    const subCounter = new Map<number, number>();
+    let fan = 0;
+    sorted.forEach((it, i) => {
+      let dx = 0, dy = 0;
+      if (it.scale < 1) {
+        const subN = Math.max(1, Math.round(1 / it.scale));
+        const n = subCounter.get(subN) ?? 0;
+        subCounter.set(subN, n + 1);
+        const sub = cellPx / subN;
+        const col = n % subN, row = Math.floor(n / subN);
+        dx = (col + 0.5) * sub - cellPx / 2;
+        dy = (row + 0.5) * sub - cellPx / 2;
+      } else if (group.length > 1) {
+        const step = Math.min(cellPx * 0.18, 16);
+        dx = fan * step; dy = fan * step; fan++;
+      }
+      out.set(it.entityId, { dx, dy, z: 20 + i });
+    });
+  }
+  return out;
+}
+
 interface View { scale: number; tx: number; ty: number; }
 interface DragState { entityId: Id; footprint: number; baseGx: number; baseGy: number; startX: number; startY: number; startScale: number; }
 interface TplDrag { id: Id; baseIX: number; baseIY: number; startX: number; startY: number; startScale: number; }
@@ -41,7 +82,6 @@ interface Props {
   campaignId: Id;
   mapId: Id;
   sceneId: Id;
-  ownerId: Id;
   distanceUnit?: DistanceUnit; // [future] driven by Campaign.settings.distanceUnit
 }
 
@@ -51,7 +91,7 @@ interface Props {
  * and AoE cell geometry all come from the active ruleset. Distances render via
  * formatDistance(), so the ft<->m unit hook is already wired.
  */
-export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, ownerId, distanceUnit = "ft" }: Props) {
+export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, distanceUnit = "ft" }: Props) {
   const [maps, setMaps] = useState<MapDoc[]>([]);
   const [entities, setEntities] = useState<Entity[]>([]);
   const [assets, setAssets] = useState<Asset[]>([]);
@@ -106,14 +146,6 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, own
       for (let gx = 0; gx < cols; gx++)
         if (!occ.has(`${gx},${gy}`)) { cell = { gx, gy }; break outer; }
     saveMap({ tokens: [...map.tokens, { entityId, gx: cell.gx, gy: cell.gy }] });
-  };
-
-  const addNpcToMap = async () => {
-    const n = entities.filter((e) => e.kind === "npc").length + 1;
-    const ent = createEntity({ campaignId, ownerId, ruleset, name: `NPC ${n}`, kind: "npc" });
-    await repo.put<Entity>("entities", ent);
-    placeToken(ent.id);
-    setSelected(ent.id);
   };
 
   // ---- AoE templates -------------------------------------------------------
@@ -275,7 +307,6 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, own
       {/* toolbar: overlays + tokens */}
       <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, marginBottom: 8 }}>
         <button style={btn(C.text, showReach)} onClick={() => setShowReach((s) => !s)}>Reach {showReach ? "on" : "off"}</button>
-        <button style={btn(C.npc)} onClick={addNpcToMap}>+ New NPC</button>
         {canAoe && <>
           <span style={{ ...label, marginLeft: 6 }}>AoE:</span>
           <button style={btn(C.gold)} onClick={() => addTemplate("burst")}>+ Burst</button>
@@ -313,12 +344,22 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, own
           {showReach && map.tokens.map((t) => {
             const e = entityById.get(t.entityId);
             if (!e) return null;
-            const cells = ruleset.reachCells(e.sizeId ?? "medium");
+            const sid = e.sizeId ?? "medium";
+            const reachWeapon = !!e.attributes.reachWeapon;
+            let cells = ruleset.reachCells(sid);
+            if (reachWeapon) {
+              // Reach weapon: threaten only the ring beyond normal reach up to
+              // double reach — strikes at range but not adjacent foes.
+              const extended = ruleset.reachCells(sid, sizeOf(e).reachFt * 2);
+              const near = new Set(cells.map((c) => `${c.x},${c.y}`));
+              cells = extended.filter((c) => !near.has(`${c.x},${c.y}`));
+            }
             if (!cells.length) return null;
             const pos = drag?.entityId === t.entityId && dragCell ? dragCell : t;
             const accent = e.color || (e.kind === "pc" ? C.pc : C.npc);
+            const fillA = reachWeapon ? 0.1 : 0.16;
             return cells.map((c) => (
-              <div key={`reach-${t.entityId}-${c.x}-${c.y}`} style={{ position: "absolute", left: g.offsetX + (pos.gx + c.x) * g.cellPx, top: g.offsetY + (pos.gy + c.y) * g.cellPx, width: g.cellPx, height: g.cellPx, background: hexToRgba(accent, 0.16), border: `1px solid ${hexToRgba(accent, 0.32)}`, pointerEvents: "none", zIndex: 6 }} />
+              <div key={`reach-${t.entityId}-${c.x}-${c.y}`} style={{ position: "absolute", left: g.offsetX + (pos.gx + c.x) * g.cellPx, top: g.offsetY + (pos.gy + c.y) * g.cellPx, width: g.cellPx, height: g.cellPx, background: hexToRgba(accent, fillA), border: `1px ${reachWeapon ? "dashed" : "solid"} ${hexToRgba(accent, 0.32)}`, pointerEvents: "none", zIndex: 6 }} />
             ));
           })}
 
@@ -355,37 +396,78 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, own
             <div style={{ position: "absolute", left: g.offsetX + dragCell.gx * g.cellPx, top: g.offsetY + dragCell.gy * g.cellPx, width: drag.footprint * g.cellPx, height: drag.footprint * g.cellPx, border: `2px dashed ${C.gold}`, background: "rgba(212,175,55,0.12)", borderRadius: 4, pointerEvents: "none", zIndex: 18 }} />
           )}
 
-          {/* tokens */}
-          {map.tokens.map((t) => {
-            const e = entityById.get(t.entityId);
-            if (!e) return null;
-            const sd = sizeOf(e);
-            const live = drag?.entityId === t.entityId && dragCell ? dragCell : t;
-            const box = sd.footprint * g.cellPx, dia = box * sd.scale;
-            const accent = e.color || (e.kind === "pc" ? C.pc : C.npc);
-            const isSel = selected === t.entityId;
-            const isActive = activeId === t.entityId;
-            const portrait = e.portraitAssetId ? assetById.get(e.portraitAssetId)?.storageRef ?? null : null;
-            const ring = isActive
-              ? `0 0 0 3px ${C.gold}, 0 0 12px rgba(212,175,55,0.85)`
-              : isSel ? `0 0 0 2px rgba(255,255,255,0.55)` : "0 1px 3px rgba(0,0,0,0.6)";
-            return (
-              <div key={t.entityId}
-                onPointerDown={(ev) => onTokenPointerDown(ev, t)} onPointerMove={onTokenPointerMove} onPointerUp={onTokenPointerUp}
-                onDoubleClick={(ev) => { ev.stopPropagation(); removeToken(t.entityId); }}
-                title={`${e.name} — drag to move, double-click to remove`}
-                style={{ position: "absolute", left: g.offsetX + live.gx * g.cellPx, top: g.offsetY + live.gy * g.cellPx, width: box, height: box, display: "flex", alignItems: "center", justifyContent: "center", cursor: "grab", zIndex: isActive ? 32 : isSel ? 30 : 20 }}>
-                <div style={{ width: dia, height: dia, borderRadius: "50%", overflow: "hidden", background: portrait ? "#0a0c11" : `${accent}cc`, border: `2px solid ${isActive ? C.gold : "#0a0c11"}`, boxShadow: ring, display: "flex", alignItems: "center", justifyContent: "center", color: "#0a0c11", fontWeight: 800, fontSize: Math.max(9, Math.min(16, dia * 0.4)) }}>
-                  {portrait
-                    ? <img src={portrait} alt="" draggable={false} style={{ width: "100%", height: "100%", objectFit: "cover", userSelect: "none" }} />
-                    : initials(e.name)}
-                </div>
-                {sd.scale >= 1 && (
-                  <span style={{ position: "absolute", top: box - 2, left: "50%", transform: "translateX(-50%)", whiteSpace: "nowrap", fontSize: 10, fontWeight: 700, color: C.text, background: "rgba(10,12,17,0.75)", padding: "0 4px", borderRadius: 3 }}>{e.name}</span>
-                )}
-              </div>
+          {/* tokens (with same-cell stacking, condition icons and damage) */}
+          {(() => {
+            const placed = map.tokens
+              .map((t) => {
+                const e = entityById.get(t.entityId);
+                if (!e) return null;
+                const sd = sizeOf(e);
+                const pos = drag?.entityId === t.entityId && dragCell ? dragCell : t;
+                return { t, e, sd, gx: pos.gx, gy: pos.gy };
+              })
+              .filter((x): x is NonNullable<typeof x> => x !== null);
+
+            const placements = computePlacements(
+              placed.map((p) => ({ entityId: p.t.entityId, gx: p.gx, gy: p.gy, footprint: p.sd.footprint, spaceFt: p.sd.spaceFt, scale: p.sd.scale })),
+              g.cellPx
             );
-          })}
+
+            return placed.map(({ t, e, sd, gx, gy }) => {
+              const box = sd.footprint * g.cellPx, dia = box * sd.scale;
+              const accent = e.color || (e.kind === "pc" ? C.pc : C.npc);
+              const isSel = selected === t.entityId;
+              const isActive = activeId === t.entityId;
+              const portrait = e.portraitAssetId ? assetById.get(e.portraitAssetId)?.storageRef ?? null : null;
+              const pl = placements.get(t.entityId) ?? { dx: 0, dy: 0, z: 20 };
+              const z = isActive ? 100 : isSel ? 90 : pl.z;
+              const ring = isActive
+                ? `0 0 0 3px ${C.gold}, 0 0 12px rgba(212,175,55,0.85)`
+                : isSel ? `0 0 0 2px rgba(255,255,255,0.55)` : "0 1px 3px rgba(0,0,0,0.6)";
+              const damage = Number(e.attributes.damage) || 0;
+              const conds = e.conditions
+                .map((id) => ruleset.conditions.find((c) => c.id === id))
+                .filter((c): c is NonNullable<typeof c> => !!c);
+              const shown = conds.slice(0, 6);
+              const extra = conds.length - shown.length;
+              const badge = Math.max(10, Math.min(15, g.cellPx * 0.26));
+
+              return (
+                <div key={t.entityId}
+                  onPointerDown={(ev) => onTokenPointerDown(ev, t)} onPointerMove={onTokenPointerMove} onPointerUp={onTokenPointerUp}
+                  onDoubleClick={(ev) => { ev.stopPropagation(); removeToken(t.entityId); }}
+                  title={`${e.name}${conds.length ? " — " + conds.map((c) => c.label).join(", ") : ""}`}
+                  style={{ position: "absolute", left: g.offsetX + gx * g.cellPx, top: g.offsetY + gy * g.cellPx, width: box, height: box, transform: `translate(${pl.dx}px, ${pl.dy}px)`, display: "flex", alignItems: "center", justifyContent: "center", cursor: "grab", zIndex: z }}>
+                  <div style={{ width: dia, height: dia, borderRadius: "50%", overflow: "hidden", background: portrait ? "#0a0c11" : `${accent}cc`, border: `2px solid ${isActive ? C.gold : "#0a0c11"}`, boxShadow: ring, display: "flex", alignItems: "center", justifyContent: "center", color: "#0a0c11", fontWeight: 800, fontSize: Math.max(9, Math.min(16, dia * 0.4)) }}>
+                    {portrait
+                      ? <img src={portrait} alt="" draggable={false} style={{ width: "100%", height: "100%", objectFit: "cover", userSelect: "none" }} />
+                      : initials(e.name)}
+                  </div>
+
+                  {/* damage badge */}
+                  {damage > 0 && (
+                    <span style={{ position: "absolute", top: -4, right: -4, minWidth: badge, height: badge, padding: "0 3px", boxSizing: "border-box", borderRadius: badge, background: C.danger, color: "#fff", fontWeight: 800, fontSize: badge * 0.62, lineHeight: `${badge}px`, textAlign: "center", border: "1px solid #0a0c11" }}>
+                      {damage}
+                    </span>
+                  )}
+
+                  {/* condition icons */}
+                  {shown.length > 0 && (
+                    <div style={{ position: "absolute", top: -badge - 2, left: "50%", transform: "translateX(-50%)", display: "flex", gap: 1, whiteSpace: "nowrap", background: "rgba(10,12,17,0.7)", borderRadius: badge, padding: "1px 3px" }}>
+                      {shown.map((c) => (
+                        <span key={c.id} title={c.label} style={{ fontSize: badge * 0.8, lineHeight: `${badge}px` }}>{c.icon ?? "•"}</span>
+                      ))}
+                      {extra > 0 && <span style={{ fontSize: badge * 0.6, color: C.text, lineHeight: `${badge}px`, fontWeight: 800 }}>+{extra}</span>}
+                    </div>
+                  )}
+
+                  {sd.scale >= 1 && (
+                    <span style={{ position: "absolute", top: box - 2, left: "50%", transform: "translateX(-50%)", whiteSpace: "nowrap", fontSize: 10, fontWeight: 700, color: C.text, background: "rgba(10,12,17,0.75)", padding: "0 4px", borderRadius: 3 }}>{e.name}</span>
+                  )}
+                </div>
+              );
+            });
+          })()}
         </div>
 
         {/* drag distance readout */}

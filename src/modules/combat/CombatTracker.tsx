@@ -6,6 +6,7 @@ import { cloneEntity, createEntity } from "../../core/domain/factory";
 import { fileToImageAsset } from "../../core/assets";
 import type { Repository } from "../../core/persistence/repository";
 import type { Ruleset } from "../../core/ruleset/ruleset";
+import { pushSnapshot, undoSnapshot, clearHistory, historyDepth } from "./turnHistory";
 
 const C = {
   panel: "#13161f", row: "#1a1e29", border: "#2b3142", text: "#e9e3d4",
@@ -39,6 +40,7 @@ export default function CombatTracker({ repo, ruleset, campaignId, sceneId, owne
   const [assets, setAssets] = useState<Asset[]>([]);
   const [dmg, setDmg] = useState<Record<Id, string>>({});
   const [newName, setNewName] = useState("");
+  const [histCount, setHistCount] = useState(historyDepth());
 
   useEffect(() => repo.subscribe<Entity>("entities", { campaignId }, setEntities), [repo, campaignId]);
   useEffect(() => repo.subscribe<Scene>("scenes", { campaignId }, setScenes), [repo, campaignId]);
@@ -99,13 +101,43 @@ export default function CombatTracker({ repo, ruleset, campaignId, sceneId, owne
     }
   };
 
-  const startTurns = () => saveScene({ round: 1, activeEntityId: ordered[0]?.id });
-  const nextTurn = () => {
+  // Snapshot the state at the start of every turn so it can be undone.
+  const snap = async () => { await pushSnapshot(repo, campaignId); setHistCount(historyDepth()); };
+  const startTurns = async () => { await snap(); saveScene({ round: 1, activeEntityId: ordered[0]?.id }); };
+  const nextTurn = async () => {
     if (!ordered.length || !scene) return;
+    await snap();
     const i = ordered.findIndex((e) => e.id === activeId);
     if (i === -1) saveScene({ activeEntityId: ordered[0].id });
     else if (i + 1 >= ordered.length) saveScene({ activeEntityId: ordered[0].id, round: round + 1 });
     else saveScene({ activeEntityId: ordered[i + 1].id });
+  };
+  const undo = async () => {
+    await undoSnapshot(repo, campaignId);
+    setHistCount(historyDepth());
+  };
+
+  // Start a fresh encounter: drop NPCs, clear the board and per-encounter state,
+  // keep the party (PCs) and the campaign. (Cloud: GM-only, enforced by RLS.)
+  const resetCombat = async () => {
+    if (!window.confirm("Start a new combat? This deletes all NPCs, clears the board (tokens, AoE templates, map image), resets damage, conditions and the round. Player characters are kept.")) return;
+    try {
+      for (const e of entities.filter((x) => x.kind === "npc")) await repo.remove("entities", e.id);
+      for (const e of entities.filter((x) => x.kind !== "npc")) {
+        await repo.put<Entity>("entities", { ...e, attributes: { ...e.attributes, damage: 0, initiative: 0 }, conditions: [] });
+      }
+      const maps = await repo.list<MapDoc>("maps", { campaignId });
+      for (const m of maps) {
+        if (m.backgroundAssetId) await repo.remove("assets", m.backgroundAssetId).catch(() => undefined);
+        await repo.put<MapDoc>("maps", { ...m, tokens: [], aoeTemplates: [], backgroundAssetId: undefined });
+      }
+      if (scene) await repo.put<Scene>("scenes", { ...scene, round: 1, activeEntityId: undefined });
+      clearHistory();
+      setHistCount(0);
+    } catch (err) {
+      alert("Couldn't reset combat. In cloud mode only the GM can start a new combat.");
+      console.error(err);
+    }
   };
 
   const toggle = (e: Entity, cond: string) => {
@@ -129,9 +161,11 @@ export default function CombatTracker({ repo, ruleset, campaignId, sceneId, owne
         <span style={{ color: C.dim, fontSize: 12, fontWeight: 700 }}>ROUND</span>
         <span style={{ color: C.gold, fontSize: 22, fontWeight: 800 }}>{round}</span>
         <div style={{ flex: 1 }} />
+        <button style={{ ...btn(C.text), opacity: histCount ? 1 : 0.4, cursor: histCount ? "pointer" : "default" }} disabled={!histCount} onClick={undo} title="Go back to the start of the previous turn">↶ Undo turn{histCount ? ` (${histCount})` : ""}</button>
         <button style={btn(C.text)} onClick={startTurns}>Start / Order</button>
         <button style={btn(C.gold)} onClick={rollAllNpcs}>Roll NPCs</button>
         <button style={{ ...btn(C.gold), background: C.gold, color: "#0a0c11" }} onClick={nextTurn}>Next turn</button>
+        <button style={{ ...btn(C.danger), borderColor: `${C.danger}66` }} onClick={resetCombat}>New combat</button>
       </div>
 
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
@@ -181,6 +215,11 @@ export default function CombatTracker({ repo, ruleset, campaignId, sceneId, owne
                 <span style={{ fontSize: 9, fontWeight: 800, color: accent, border: `1px solid ${accent}55`, borderRadius: 4, padding: "2px 5px" }}>
                   {e.kind.toUpperCase()}
                 </span>
+                <input
+                  type="color" title="Token color" value={accent}
+                  onChange={(ev) => save(e, {}, { color: ev.target.value })}
+                  style={{ width: 26, height: 22, padding: 0, border: `1px solid ${C.border}`, background: "transparent", cursor: "pointer" }}
+                />
                 <select
                   value={e.sizeId ?? "medium"}
                   onChange={(ev) => save(e, {}, { sizeId: ev.target.value })}
@@ -188,6 +227,15 @@ export default function CombatTracker({ repo, ruleset, campaignId, sceneId, owne
                 >
                   {ruleset.sizes.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
                 </select>
+                {(ruleset.sizes.find((s) => s.id === (e.sizeId ?? "medium"))?.reachFt ?? 0) > 0 && (
+                  <button
+                    style={btn(e.attributes.reachWeapon ? C.gold : C.dim)}
+                    title="Reach weapon: doubles reach. Threatens at range but not adjacent foes (shown on the map when Reach is on)."
+                    onClick={() => save(e, { reachWeapon: !e.attributes.reachWeapon })}
+                  >
+                    Reach ×2
+                  </button>
+                )}
                 {e.kind === "npc" && <button style={btn(C.gold)} onClick={() => roll(e)}>Roll</button>}
                 {e.kind === "npc" && <button style={btn(C.text)} title="Duplicate this NPC" onClick={() => cloneNpc(e)}>Clone</button>}
                 <button style={{ ...btn(C.dim), padding: "5px 8px" }} title="Remove combatant" onClick={() => removeEntity(e)}>✕</button>

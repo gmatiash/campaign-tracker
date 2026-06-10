@@ -70,11 +70,18 @@ const SIZES: SizeDef[] = [
   { id: "colossal", label: "Colossal", footprint: 6, spaceFt: 30, reachFt: 30, scale: 1 },
 ];
 
+const CONDITION_ICON: Record<string, string> = {
+  blinded: "👁", cowering: "😰", dazed: "😵", dazzled: "✨", dead: "💀",
+  deafened: "🔇", entangled: "🕸", exhausted: "😩", fatigued: "😪", frightened: "😨",
+  grappled: "🤼", nauseated: "🤢", panicked: "😱", paralyzed: "🧊", pinned: "📌",
+  prone: "⬇️", shaken: "😬", sickened: "🤒", stunned: "💫", unconscious: "💤",
+};
+
 const CONDITIONS: ConditionDef[] = [
   "blinded", "cowering", "dazed", "dazzled", "dead", "deafened", "entangled",
   "exhausted", "fatigued", "frightened", "grappled", "nauseated", "panicked",
   "paralyzed", "pinned", "prone", "shaken", "sickened", "stunned", "unconscious",
-].map((id) => ({ id, label: id[0].toUpperCase() + id.slice(1) }));
+].map((id) => ({ id, label: id[0].toUpperCase() + id.slice(1), icon: CONDITION_ICON[id] }));
 
 export const dnd35: Ruleset = {
   meta: { id: "dnd35", name: "D&D 3.5e", version: "1.0.0" },
@@ -103,11 +110,12 @@ export const dnd35: Ruleset = {
     return diagDistance(Math.abs(to.x - from.x), Math.abs(to.y - from.y));
   },
 
-  reachCells(sizeId: string): CellOffset[] {
+  reachCells(sizeId: string, reachFtOverride?: number): CellOffset[] {
     const def = SIZES.find((s) => s.id === sizeId);
-    if (!def || def.reachFt <= 0) return [];
+    if (!def) return [];
+    const reachFt = reachFtOverride ?? def.reachFt;
+    if (reachFt <= 0) return [];
     const sq = def.footprint;
-    const reachFt = def.reachFt;
     const R = Math.ceil(reachFt / 5);
     const cells: CellOffset[] = [];
     for (let x = -R; x < sq + R; x++) {

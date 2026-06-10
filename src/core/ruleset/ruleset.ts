@@ -64,7 +64,12 @@ export interface Ruleset {
   rollInitiative(entity: Entity): number;
 
   measureDistanceFt(from: CellOffset, to: CellOffset): number;
-  reachCells(sizeId: string): CellOffset[];
+
+  /**
+   * Threatened squares for a creature, as offsets from its footprint origin.
+   * Pass reachFtOverride to compute at a non-default reach (e.g. a reach weapon).
+   */
+  reachCells(sizeId: string, reachFtOverride?: number): CellOffset[];
 
   /**
    * Grid cells an area template covers, as offsets (in cells) from the template's

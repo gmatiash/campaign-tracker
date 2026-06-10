@@ -12,6 +12,7 @@ import { exportCampaign, importCampaign, downloadBackup } from "../core/persiste
 import { getRuleset } from "../core/ruleset/ruleset";
 import "../systems"; // registers all available rule systems
 import CombatTracker from "../modules/combat/CombatTracker";
+import { clearHistory } from "../modules/combat/turnHistory";
 import MapView from "../modules/map/MapView";
 import MembersPanel from "./MembersPanel";
 import SignIn from "./auth/SignIn";
@@ -74,6 +75,7 @@ async function resetToDemo(ownerId: Id): Promise<void> {
     const recs = await repo.list(c, { campaignId: CAMPAIGN_ID });
     for (const r of recs) await repo.remove(c, r.id);
   }
+  clearHistory();
   await seedDemo(ownerId);
 }
 
@@ -168,7 +170,7 @@ function MainApp({ ownerId, userLabel, onSignOut }: { ownerId: Id; userLabel?: s
           : "Storage is local (IndexedDB) and persists across reloads; use Export/Import for backups."}
       </p>
       {cloud && <MembersPanel campaignId={CAMPAIGN_ID} currentUserId={ownerId} />}
-      <MapView repo={repo} ruleset={ruleset} campaignId={CAMPAIGN_ID} mapId={MAP_ID} sceneId={SCENE_ID} ownerId={ownerId} />
+      <MapView repo={repo} ruleset={ruleset} campaignId={CAMPAIGN_ID} mapId={MAP_ID} sceneId={SCENE_ID} />
       <CombatTracker repo={repo} ruleset={ruleset} campaignId={CAMPAIGN_ID} sceneId={SCENE_ID} ownerId={ownerId} />
     </div>
   );
