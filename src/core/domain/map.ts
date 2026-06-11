@@ -38,7 +38,7 @@ export interface AoeTemplate {
 }
 
 export interface Wall {
-  // [future] drives fog of war, light, and spell-range limits
+  // drives fog of war, light, and (later) spell-range limits
   id: Id;
   points: Array<[number, number]>;
   blocksMovement: boolean;
@@ -46,6 +46,16 @@ export interface Wall {
   blocksLineOfSight: boolean;
   blocksEffect: boolean;
   door?: boolean; // a door: blocks like a wall but is shown to players from a revealed side
+}
+
+export interface LightSource {
+  id: Id;
+  gx: number;
+  gy: number;
+  shape: "radial" | "cone";
+  brightFt: number; // clear radius; shadowy extends to 2x this
+  dir?: number; // degrees clockwise from +x (cone only)
+  color?: string;
 }
 
 export interface FogState {
@@ -64,6 +74,7 @@ export interface MapDoc extends BaseRecord {
   tokens: TokenPlacement[];
   aoeTemplates: AoeTemplate[];
   walls: Wall[];
+  lights?: LightSource[];
   fog?: FogState;
 }
 

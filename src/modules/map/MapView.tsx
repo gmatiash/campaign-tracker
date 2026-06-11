@@ -4,7 +4,8 @@ import type { CSSProperties, PointerEvent as RPointerEvent, WheelEvent as RWheel
 import type { Campaign, Entity, Id, Scene } from "../../core/domain/domain";
 import { fileToImageAsset, removeImage } from "../../core/assets";
 import { detectGrid } from "../../core/gridDetect";
-import type { AoeTemplate, Asset, GridConfig, MapDoc, Wall } from "../../core/domain/map";
+import type { AoeTemplate, Asset, GridConfig, MapDoc, Wall, LightSource } from "../../core/domain/map";
+import { computeLighting } from "../../core/lighting";
 import type { Repository } from "../../core/persistence/repository";
 import type { AoeShape, Dir8, Ruleset } from "../../core/ruleset/ruleset";
 import type { DistanceUnit } from "../../core/units";
@@ -134,6 +135,10 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
   const [fogTool, setFogTool] = useState<"off" | "reveal" | "hide" | "room" | "wall" | "door">("off");
   const [roomMode, setRoomMode] = useState<"reveal" | "hide">("reveal");
   const [viewAsPlayer, setViewAsPlayer] = useState(false);
+  const [showLight, setShowLight] = useState(false);
+  const [selLight, setSelLight] = useState<Id | null>(null);
+  const [lightDrag, setLightDrag] = useState<{ id: Id; baseGx: number; baseGy: number; startX: number; startY: number; startScale: number } | null>(null);
+  const [lightPos, setLightPos] = useState<{ gx: number; gy: number } | null>(null);
   const [boxRect, setBoxRect] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
   const boxStartRef = useRef<{ gx: number; gy: number } | null>(null);
   const wallStartRef = useRef<{ ix: number; iy: number } | null>(null);
@@ -227,6 +232,20 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
       console.error(err);
     }
   };
+
+  // ---- light sources + vision ----------------------------------------------
+  const setEntityAttr = (e: Entity, patch: Record<string, unknown>) =>
+    repo.put<Entity>("entities", { ...e, attributes: { ...e.attributes, ...patch }, updatedAt: Date.now() });
+  const addLight = () => {
+    if (!map) return;
+    const cols = Math.max(1, Math.floor(map.width / map.grid.cellPx)), rows = Math.max(1, Math.floor(map.height / map.grid.cellPx));
+    const L: LightSource = { id: uid(), gx: Math.floor(cols / 2), gy: Math.floor(rows / 2), shape: "radial", brightFt: 20, color: "#f5a623" };
+    saveMap({ lights: [...(map.lights ?? []), L] });
+    setSelLight(L.id); setSelected(null); setSelTpl(null);
+  };
+  const updateLight = (id: Id, patch: Partial<LightSource>) =>
+    map && saveMap({ lights: (map.lights ?? []).map((L) => (L.id === id ? { ...L, ...patch } : L)) });
+  const removeLight = (id: Id) => { if (map) saveMap({ lights: (map.lights ?? []).filter((L) => L.id !== id) }); setSelLight(null); };
 
   // ---- background upload ---------------------------------------------------
   const loadImageFile = async (file: File) => {
@@ -577,6 +596,26 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
     setTplDrag(null); setTplOrigin(null);
   };
 
+  // ---- light drag (snap to cell) -------------------------------------------
+  const onLightPointerDown = (e: RPointerEvent<HTMLDivElement>, L: LightSource) => {
+    e.stopPropagation();
+    setSelLight(L.id); setSelected(null); setSelTpl(null);
+    setLightDrag({ id: L.id, baseGx: L.gx, baseGy: L.gy, startX: e.clientX, startY: e.clientY, startScale: view.scale });
+    setLightPos({ gx: L.gx, gy: L.gy });
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+  const onLightPointerMove = (e: RPointerEvent<HTMLDivElement>) => {
+    if (!lightDrag || !map) return;
+    const dx = Math.round((e.clientX - lightDrag.startX) / lightDrag.startScale / map.grid.cellPx);
+    const dy = Math.round((e.clientY - lightDrag.startY) / lightDrag.startScale / map.grid.cellPx);
+    const cols = Math.floor(map.width / map.grid.cellPx), rows = Math.floor(map.height / map.grid.cellPx);
+    setLightPos({ gx: clamp(lightDrag.baseGx + dx, 0, cols - 1), gy: clamp(lightDrag.baseGy + dy, 0, rows - 1) });
+  };
+  const onLightPointerUp = () => {
+    if (lightDrag && lightPos) updateLight(lightDrag.id, { gx: lightPos.gx, gy: lightPos.gy });
+    setLightDrag(null); setLightPos(null);
+  };
+
   const dragDistanceLabel = useMemo(() => {
     if (!drag || !dragCell || !map) return null;
     if (dragPath?.blocked) return "✕ blocked by a wall";
@@ -585,6 +624,40 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
       : ruleset.measureDistanceFt({ x: drag.baseGx, y: drag.baseGy }, { x: dragCell.gx, y: dragCell.gy });
     return formatDistance(ft, { unit });
   }, [drag, dragCell, dragPath, map, ruleset, unit]);
+
+  // ---- lighting (sources, viewer perspective, wall-occluded illumination) --
+  const lightSources = useMemo(() => {
+    if (!map) return [];
+    const arr: Array<{ gx: number; gy: number; shape: "radial" | "cone"; brightFt: number; dir?: number }> = [];
+    for (const L of map.lights ?? []) arr.push({ gx: L.gx, gy: L.gy, shape: L.shape, brightFt: L.brightFt, dir: L.dir });
+    for (const t of map.tokens) {
+      const e = entityById.get(t.entityId);
+      const ft = Number(e?.attributes.lightFt) || 0;
+      if (e && ft > 0) arr.push({ gx: t.gx, gy: t.gy, shape: e.attributes.lightCone ? "cone" : "radial", brightFt: ft, dir: Number(e.attributes.lightDir) || 0 });
+    }
+    return arr;
+  }, [map, entityById]);
+  // The selected token's perspective (low-light doubling / darkvision), else standard.
+  const viewer = useMemo(() => {
+    if (!selected || !map) return null;
+    const e = entityById.get(selected);
+    const t = map.tokens.find((tt) => tt.entityId === selected);
+    if (!e || !t) return null;
+    const lowLight = !!e.attributes.lowLight;
+    const darkvisionFt = Number(e.attributes.darkvisionFt) || 0;
+    if (!lowLight && !darkvisionFt) return null;
+    return { gx: t.gx, gy: t.gy, lowLight, darkvisionFt };
+  }, [selected, entityById, map]);
+  const lightWalls = useMemo(
+    () => (map?.walls ?? []).filter((w) => w.points.length >= 2).map((w) => [w.points[0], w.points[1]] as [[number, number], [number, number]]),
+    [map?.walls]
+  );
+  const lighting = useMemo(() => {
+    if (!showLight || !map) return null;
+    const cols = Math.floor(map.width / map.grid.cellPx), rows = Math.floor(map.height / map.grid.cellPx);
+    if (cols * rows === 0 || cols * rows > 3000) return null; // perf guard
+    return computeLighting({ sources: lightSources, viewer, walls: lightWalls, cols, rows, cellFt: map.grid.cellFt });
+  }, [showLight, map, lightSources, viewer, lightWalls]);
 
   // ---- styles --------------------------------------------------------------
   const btn = (color: string, on = false): CSSProperties => ({
@@ -605,6 +678,8 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
     };
   const unplaced = entities.filter((e) => !map.tokens.some((t) => t.entityId === e.id));
   const selectedTpl = map.aoeTemplates.find((t) => t.id === selTpl) ?? null;
+  const selectedLight = (map.lights ?? []).find((L) => L.id === selLight) ?? null;
+  const selEntity = selected ? entityById.get(selected) ?? null : null;
 
   return (
     <div style={{ marginTop: 16, maxWidth: 980 }}>
@@ -662,6 +737,11 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
           <button style={btn(C.gold)} onClick={() => addTemplate("burst")}>+ Burst</button>
           <button style={btn(C.gold)} onClick={() => addTemplate("cone")}>+ Cone</button>
           <button style={btn(C.gold)} onClick={() => addTemplate("line")}>+ Line</button>
+        </>}
+        {isGm && <>
+          <span style={{ ...label, marginLeft: 6 }}>Light:</span>
+          <button style={btn(C.text, showLight)} onClick={() => setShowLight((s) => !s)} title="Show wall-occluded illumination. Select a token to view from its perspective (low-light / darkvision).">{showLight ? "On" : "Off"}</button>
+          {showLight && <button style={btn(C.gold)} onClick={addLight} title="Place an independent light source">+ Light</button>}
         </>}
         {unplaced.length > 0 && <>
           <span style={{ ...label, marginLeft: 6 }}>Place:</span>
@@ -845,6 +925,33 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
             });
           })()}
 
+          {/* lighting overlay (dim/dark cells), below tokens so they stay visible */}
+          {showLight && lighting && (() => {
+            const cols = Math.floor(map.width / map.grid.cellPx), rows = Math.floor(map.height / map.grid.cellPx);
+            const rects: JSX.Element[] = [];
+            for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+              const lvl = lighting.get(`${x},${y}`) ?? 0;
+              if (lvl === 2) continue;
+              rects.push(<rect key={`lit-${x}-${y}`} x={g.offsetX + x * g.cellPx} y={g.offsetY + y * g.cellPx} width={g.cellPx} height={g.cellPx} fill="#03040a" opacity={lvl === 1 ? 0.34 : 0.62} />);
+            }
+            return <svg width={map.width} height={map.height} style={{ position: "absolute", left: 0, top: 0, pointerEvents: "none", zIndex: 8 }}>{rects}</svg>;
+          })()}
+
+          {/* independent light markers (GM, when lighting is on) */}
+          {isGm && showLight && (map.lights ?? []).map((L) => {
+            const pos = lightDrag?.id === L.id && lightPos ? lightPos : { gx: L.gx, gy: L.gy };
+            const cxp = g.offsetX + (pos.gx + 0.5) * g.cellPx, cyp = g.offsetY + (pos.gy + 0.5) * g.cellPx;
+            const r = clamp(g.cellPx * 0.2, 6, 15);
+            const sel = selLight === L.id;
+            return (
+              <div key={L.id}
+                onPointerDown={(e) => onLightPointerDown(e, L)} onPointerMove={onLightPointerMove} onPointerUp={onLightPointerUp}
+                onDoubleClick={(e) => { e.stopPropagation(); removeLight(L.id); }}
+                title="Light source — drag to move, double-click to remove"
+                style={{ position: "absolute", left: cxp - r, top: cyp - r, width: 2 * r, height: 2 * r, borderRadius: "50%", background: "radial-gradient(circle, #ffe79a, #f5a623)", border: `2px solid ${sel ? "#fff" : "#7a5a10"}`, boxShadow: "0 0 12px rgba(245,166,35,0.95)", cursor: "grab", touchAction: "none", zIndex: sel ? 21 : 13 }} />
+            );
+          })}
+
           {/* fog of war + walls + doors overlay (SVG) */}
           {(fog.enabled || (map.walls?.length ?? 0) > 0) && (() => {
             const { cols, rows } = gridDims();
@@ -955,6 +1062,52 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
             <button style={{ ...btn("#fff"), background: "#d9544a", border: "1px solid #d9544a" }} onClick={() => removeTpl(selectedTpl.id)}>Delete</button>
           </div>
         )}
+
+        {/* light-source editor */}
+        {isGm && showLight && selectedLight && (
+          <div onPointerDown={(e) => e.stopPropagation()}
+            style={{ position: "absolute", top: 10, left: "50%", transform: "translateX(-50%)", zIndex: 55, background: C.panel, border: `1px solid ${C.border}`, borderRadius: 9, padding: "8px 10px", display: "flex", alignItems: "center", gap: 8, boxShadow: "0 8px 24px rgba(0,0,0,0.5)", flexWrap: "wrap", maxWidth: "92%" }}>
+            <span style={{ color: "#f5a623", fontWeight: 800, fontSize: 12 }}>Light</span>
+            {([5, 15, 20, 30] as const).map((ft) => (
+              <button key={ft} style={btn(C.text, selectedLight.shape === "radial" && selectedLight.brightFt === ft)} onClick={() => updateLight(selectedLight.id, { shape: "radial", brightFt: ft })}>{formatDistance(ft, { unit })}</button>
+            ))}
+            <button style={btn(C.text, selectedLight.shape === "cone")} onClick={() => updateLight(selectedLight.id, { shape: "cone", brightFt: 60 })} title="60 ft cone">Cone</button>
+            {selectedLight.shape === "cone" && (
+              <>
+                <span style={label}>Aim</span>
+                <input type="range" min={0} max={355} step={5} value={Math.round(selectedLight.dir ?? 0)} onChange={(e) => updateLight(selectedLight.id, { dir: Number(e.target.value) })} />
+                <span style={{ ...label, width: 34 }}>{Math.round(selectedLight.dir ?? 0)}°</span>
+              </>
+            )}
+            <button style={{ ...btn("#fff"), background: "#d9544a", border: "1px solid #d9544a" }} onClick={() => removeLight(selectedLight.id)}>Delete</button>
+          </div>
+        )}
+
+        {/* token light & vision editor */}
+        {isGm && showLight && selEntity && (() => {
+          const lf = Number(selEntity.attributes.lightFt) || 0;
+          const dv = Number(selEntity.attributes.darkvisionFt) || 0;
+          return (
+            <div onPointerDown={(e) => e.stopPropagation()}
+              style={{ position: "absolute", top: 10, left: "50%", transform: "translateX(-50%)", zIndex: 55, background: C.panel, border: `1px solid ${C.border}`, borderRadius: 9, padding: "8px 10px", display: "flex", alignItems: "center", gap: 8, boxShadow: "0 8px 24px rgba(0,0,0,0.5)", flexWrap: "wrap", maxWidth: "94%" }}>
+              <span style={{ color: C.gold, fontWeight: 800, fontSize: 12, maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{selEntity.name}</span>
+              <span style={label}>Light</span>
+              {([0, 5, 15, 20, 30] as const).map((ft) => (
+                <button key={ft} style={btn(C.text, lf === ft)} onClick={() => setEntityAttr(selEntity, { lightFt: ft })}>{ft ? formatDistance(ft, { unit }) : "None"}</button>
+              ))}
+              <button style={btn(C.text, !!selEntity.attributes.lightCone)} onClick={() => setEntityAttr(selEntity, { lightCone: !selEntity.attributes.lightCone })} title="Emit a cone instead of a radius">Cone</button>
+              {!!selEntity.attributes.lightCone && (
+                <>
+                  <span style={label}>Aim</span>
+                  <input type="range" min={0} max={355} step={5} value={Number(selEntity.attributes.lightDir) || 0} onChange={(e) => setEntityAttr(selEntity, { lightDir: Number(e.target.value) })} />
+                </>
+              )}
+              <span style={{ ...label, marginLeft: 6 }}>Vision</span>
+              <button style={btn(C.text, !!selEntity.attributes.lowLight)} onClick={() => setEntityAttr(selEntity, { lowLight: !selEntity.attributes.lowLight })} title="Doubles the bright & shadowy range of every light (from this token's view)">Low-light</button>
+              <button style={btn(C.text, dv > 0)} onClick={() => setEntityAttr(selEntity, { darkvisionFt: dv > 0 ? 0 : 60 })} title="Sees its own radius as bright, even in darkness">Darkvision 60</button>
+            </div>
+          );
+        })()}
       </div>
 
       <p style={{ fontSize: 11, color: C.dim, marginTop: 6 }}>
