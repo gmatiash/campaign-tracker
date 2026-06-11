@@ -108,14 +108,31 @@ export default function CombatTracker({ repo, ruleset, campaignId, sceneId, owne
 
   // Snapshot the state at the start of every turn so it can be undone.
   const snap = async () => { await pushSnapshot(repo, campaignId); setHistCount(historyDepth()); };
+  // Tick down timed conditions on the entity whose turn is starting; drop expired.
+  const tickConditions = async (entId: Id | undefined) => {
+    if (!entId) return;
+    const e = entities.find((x) => x.id === entId);
+    if (!e) return;
+    const cr = { ...(e.attributes.conditionRounds as Record<string, number> | undefined ?? {}) };
+    if (Object.keys(cr).length === 0) return;
+    let conditions = [...e.conditions];
+    for (const id of Object.keys(cr)) {
+      if (!conditions.includes(id)) { delete cr[id]; continue; }
+      cr[id] -= 1;
+      if (cr[id] <= 0) { delete cr[id]; conditions = conditions.filter((c) => c !== id); }
+    }
+    await repo.put<Entity>("entities", { ...e, conditions, attributes: { ...e.attributes, conditionRounds: cr } });
+  };
   const startTurns = async () => { await snap(); saveScene({ round: 1, activeEntityId: ordered[0]?.id }); };
   const nextTurn = async () => {
     if (!ordered.length || !scene) return;
     await snap();
     const i = ordered.findIndex((e) => e.id === activeId);
-    if (i === -1) saveScene({ activeEntityId: ordered[0].id });
-    else if (i + 1 >= ordered.length) saveScene({ activeEntityId: ordered[0].id, round: round + 1 });
-    else saveScene({ activeEntityId: ordered[i + 1].id });
+    let newId: Id;
+    if (i === -1) { newId = ordered[0].id; saveScene({ activeEntityId: newId }); }
+    else if (i + 1 >= ordered.length) { newId = ordered[0].id; saveScene({ activeEntityId: newId, round: round + 1 }); }
+    else { newId = ordered[i + 1].id; saveScene({ activeEntityId: newId }); }
+    await tickConditions(newId);
   };
   const undo = async () => {
     await undoSnapshot(repo, campaignId);
@@ -129,7 +146,7 @@ export default function CombatTracker({ repo, ruleset, campaignId, sceneId, owne
     try {
       for (const e of entities.filter((x) => x.kind === "npc")) await repo.remove("entities", e.id);
       for (const e of entities.filter((x) => x.kind !== "npc")) {
-        await repo.put<Entity>("entities", { ...e, attributes: { ...e.attributes, damage: 0, initiative: 0 }, conditions: [] });
+        await repo.put<Entity>("entities", { ...e, attributes: { ...e.attributes, damage: 0, initiative: 0, conditionRounds: {} }, conditions: [] });
       }
       const maps = await repo.list<MapDoc>("maps", { campaignId });
       for (const m of maps) {
@@ -150,7 +167,15 @@ export default function CombatTracker({ repo, ruleset, campaignId, sceneId, owne
 
   const toggle = (e: Entity, cond: string) => {
     const has = e.conditions.includes(cond);
-    save(e, {}, { conditions: has ? e.conditions.filter((c) => c !== cond) : [...e.conditions, cond] });
+    const cr = { ...(e.attributes.conditionRounds as Record<string, number> | undefined ?? {}) };
+    if (has) delete cr[cond];
+    save(e, { conditionRounds: cr }, { conditions: has ? e.conditions.filter((c) => c !== cond) : [...e.conditions, cond] });
+  };
+  // Set/clear a condition's remaining-rounds timer.
+  const setCondRounds = (e: Entity, cond: string, rounds: number | null) => {
+    const cr = { ...(e.attributes.conditionRounds as Record<string, number> | undefined ?? {}) };
+    if (rounds && rounds > 0) cr[cond] = rounds; else delete cr[cond];
+    save(e, { conditionRounds: cr });
   };
   const applyDmg = (e: Entity) => {
     const v = parseInt(dmg[e.id] ?? "", 10);
@@ -287,6 +312,29 @@ export default function CombatTracker({ repo, ruleset, campaignId, sceneId, owne
                   );
                 })}
               </div>
+
+              {e.conditions.length > 0 && (() => {
+                const cr = (e.attributes.conditionRounds as Record<string, number> | undefined) ?? {};
+                return (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
+                    <span style={{ color: C.dim, fontSize: 10, fontWeight: 700 }}>Duration:</span>
+                    {e.conditions.map((id) => {
+                      const def = ruleset.conditions.find((c) => c.id === id);
+                      return (
+                        <span key={id} style={{ display: "inline-flex", alignItems: "center", gap: 3, fontSize: 10, color: C.text }}>
+                          {def?.label ?? id}
+                          <input
+                            type="number" min={0} placeholder="∞" value={cr[id] ?? ""}
+                            onChange={(ev) => { const v = parseInt(ev.target.value, 10); setCondRounds(e, id, Number.isNaN(v) ? null : v); }}
+                            title="Rounds remaining (blank = no timer). Ticks down at the start of this creature's turn."
+                            style={{ width: 34, background: C.panel, color: C.gold, fontWeight: 800, textAlign: "center", border: `1px solid ${C.border}`, borderRadius: 4, padding: "1px 2px" }}
+                          />
+                        </span>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
             </div>
           );
         })}

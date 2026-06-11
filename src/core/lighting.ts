@@ -36,6 +36,7 @@ export interface LightingInput {
   cols: number;
   rows: number;
   cellFt: number;
+  ambient?: "bright" | "dim" | "dark"; // base illumination floor (default "dark")
 }
 
 const CONE_HALF = Math.PI / 5; // ~36° half-angle (≈72° spread)
@@ -50,7 +51,7 @@ function segCross(x1: number, y1: number, x2: number, y2: number, x3: number, y3
 }
 
 export function computeLighting(input: LightingInput): Map<string, 1 | 2> {
-  const { sources, viewer, walls, cols, rows, cellFt } = input;
+  const { sources, viewer, walls, cols, rows, cellFt, ambient } = input;
   const out = new Map<string, 1 | 2>();
   const bump = (x: number, y: number, lvl: 1 | 2) => {
     const k = `${x},${y}`;
@@ -92,6 +93,13 @@ export function computeLighting(input: LightingInput): Map<string, 1 | 2> {
   if (viewer?.darkvisionFt && viewer.darkvisionFt > 0) {
     // darkvision: own radius reads as bright regardless of lights
     cast(viewer.gx, viewer.gy, viewer.darkvisionFt, viewer.darkvisionFt, null);
+  }
+
+  // Ambient floor: a lit scene (daylight/dim) raises every cell to a base level
+  // before the viewer's line of sight is applied.
+  if (ambient === "bright" || ambient === "dim") {
+    const base: 1 | 2 = ambient === "bright" ? 2 : 1;
+    for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) bump(x, y, base);
   }
 
   // Viewer field of view: a token only perceives illuminated cells it can actually

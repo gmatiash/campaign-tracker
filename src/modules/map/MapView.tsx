@@ -132,11 +132,15 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
   const [tplDrag, setTplDrag] = useState<TplDrag | null>(null);
   const [tplOrigin, setTplOrigin] = useState<{ ix: number; iy: number } | null>(null);
   const [showReach, setShowReach] = useState(false);
-  const [fogTool, setFogTool] = useState<"off" | "reveal" | "hide" | "room" | "wall" | "door">("off");
+  const [fogTool, setFogTool] = useState<"off" | "reveal" | "hide" | "room" | "wall" | "door" | "secret">("off");
   const [roomMode, setRoomMode] = useState<"reveal" | "hide">("reveal");
   const [viewAsPlayer, setViewAsPlayer] = useState(false);
   const [showLight, setShowLight] = useState(false);
   const [autoFog, setAutoFog] = useState(false);
+  const [showRange, setShowRange] = useState(false);
+  const [measure, setMeasure] = useState(false);
+  const [ruler, setRuler] = useState<{ a: { gx: number; gy: number }; b: { gx: number; gy: number } } | null>(null);
+  const rulerRef = useRef<{ gx: number; gy: number } | null>(null);
   const [selLight, setSelLight] = useState<Id | null>(null);
   const [lightDrag, setLightDrag] = useState<{ id: Id; baseGx: number; baseGy: number; startX: number; startY: number; startScale: number } | null>(null);
   const [lightPos, setLightPos] = useState<{ gx: number; gy: number } | null>(null);
@@ -295,17 +299,28 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
   };
 
   const onCanvasPointerDown = (e: RPointerEvent<HTMLDivElement>) => {
-    setSelected(null); setSelTpl(null);
+    if (measure) {
+      const c = pointToCell(e.clientX, e.clientY);
+      if (c) { rulerRef.current = c; setRuler({ a: c, b: c }); }
+      e.currentTarget.setPointerCapture(e.pointerId);
+      return;
+    }
+    setSelected(null); setSelTpl(null); setSelLight(null);
     panRef.current = { x: e.clientX, y: e.clientY };
     e.currentTarget.setPointerCapture(e.pointerId);
   };
   const onCanvasPointerMove = (e: RPointerEvent<HTMLDivElement>) => {
+    if (measure && rulerRef.current) {
+      const c = pointToCell(e.clientX, e.clientY);
+      if (c) setRuler({ a: rulerRef.current, b: c });
+      return;
+    }
     if (!panRef.current) return;
     const dx = e.clientX - panRef.current.x, dy = e.clientY - panRef.current.y;
     panRef.current = { x: e.clientX, y: e.clientY };
     setView((v) => ({ ...v, tx: v.tx + dx, ty: v.ty + dy }));
   };
-  const endPan = () => { panRef.current = null; };
+  const endPan = () => { panRef.current = null; rulerRef.current = null; };
 
   // ---- fog of war + walls --------------------------------------------------
   // NOTE: this is CLIENT-SIDE fog. The fog/wall data lives in the shared MapDoc,
@@ -338,27 +353,18 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
     return s;
   }, [map?.walls]);
 
-  // Edges that block MOVEMENT: walls, but not doors (you can walk through a door).
+  // Edges that block MOVEMENT: walls and CLOSED doors; open doors are passable.
   const moveBlocked = useMemo(() => {
     const s = new Set<string>();
     for (const w of map?.walls ?? []) {
-      if (w.door) continue;
+      if (w.door && w.open) continue;
       for (let i = 0; i + 1 < w.points.length; i++) { const k = wallEdge(w.points[i], w.points[i + 1]); if (k) s.add(k); }
     }
     return s;
   }, [map?.walls]);
 
-  // A door counts as OPEN (lets light & sight pass) when both cells it separates
-  // are revealed — or when fog is off (the whole map is "seen").
-  const doorOpen = (w: Wall): boolean => {
-    if (!w.door || w.points.length < 2) return false;
-    if (!map?.fog?.enabled) return true;
-    const [ax, ay] = w.points[0], [bx, by] = w.points[1];
-    const cells = ay === by
-      ? [[Math.min(ax, bx), ay - 1], [Math.min(ax, bx), ay]]
-      : [[ax - 1, Math.min(ay, by)], [ax, Math.min(ay, by)]];
-    return revealedSet.has(`${cells[0][0]},${cells[0][1]}`) && revealedSet.has(`${cells[1][0]},${cells[1][1]}`);
-  };
+  // A door is OPEN (passes light, sight, movement) only when explicitly opened.
+  const doorOpen = (w: Wall): boolean => !!(w.door && w.open);
 
   const PATH_LIMIT = 4000; // skip pathfinding on very large grids (perf)
   const stepAllowed = (x: number, y: number, nx: number, ny: number): boolean => {
@@ -414,6 +420,34 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
       if (dx && dy) diag++; else orth++;
     }
     return (orth + diag + Math.floor(diag / 2)) * cellFt;
+  };
+  // Dijkstra flood: cheapest 3.5e movement cost (ft) to every reachable cell within
+  // maxFt, blocked by walls and closed doors. Diagonals average 1.5 squares.
+  const reachCostMap = (sx: number, sy: number, maxFt: number, cols: number, rows: number): Map<string, number> => {
+    const cellFt = map?.grid.cellFt ?? 5;
+    const out = new Map<string, number>();
+    const N = cols * rows, idx = (x: number, y: number) => y * cols + x;
+    const dist = new Float64Array(N).fill(Infinity), done = new Uint8Array(N);
+    const heap: number[] = [];
+    const up = (i: number) => { while (i > 0) { const p = (i - 1) >> 1; if (dist[heap[p]] <= dist[heap[i]]) break; [heap[p], heap[i]] = [heap[i], heap[p]]; i = p; } };
+    const down = (i: number) => { for (;;) { const l = 2 * i + 1, r = 2 * i + 2; let m = i; if (l < heap.length && dist[heap[l]] < dist[heap[m]]) m = l; if (r < heap.length && dist[heap[r]] < dist[heap[m]]) m = r; if (m === i) break; [heap[m], heap[i]] = [heap[i], heap[m]]; i = m; } };
+    const push = (n: number) => { heap.push(n); up(heap.length - 1); };
+    const pop = () => { const top = heap[0], last = heap.pop()!; if (heap.length) { heap[0] = last; down(0); } return top; };
+    dist[idx(sx, sy)] = 0; push(idx(sx, sy));
+    const DIRS = [[1, 0, 1], [-1, 0, 1], [0, 1, 1], [0, -1, 1], [1, 1, 1.5], [1, -1, 1.5], [-1, 1, 1.5], [-1, -1, 1.5]];
+    while (heap.length) {
+      const u = pop(); if (done[u]) continue; done[u] = 1;
+      const ux = u % cols, uy = (u / cols) | 0, du = dist[u];
+      out.set(`${ux},${uy}`, du);
+      for (const [dx, dy, w] of DIRS) {
+        const nx = ux + dx, ny = uy + dy;
+        if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+        if (!stepAllowed(ux, uy, nx, ny)) continue;
+        const nd = du + w * cellFt;
+        if (nd <= maxFt + 1e-6 && nd < dist[idx(nx, ny)]) { dist[idx(nx, ny)] = nd; push(idx(nx, ny)); }
+      }
+    }
+    return out;
   };
 
   const toWorld = (clientX: number, clientY: number) => {
@@ -525,9 +559,26 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
     const edge = nearestEdge(w.wx, w.wy);
     const walls = map.walls ?? [];
     const existing = walls.find((wl) => wallEdge(wl.points[0], wl.points[1]) === edge.key);
-    if (existing && existing.door) saveMap({ walls: walls.filter((wl) => wl.id !== existing.id) });
-    else if (existing) saveMap({ walls: walls.map((wl) => (wl.id === existing.id ? { ...wl, door: true } : wl)) });
-    else saveMap({ walls: [...walls, { id: uid(), points: edge.points, blocksMovement: false, blocksLight: false, blocksLineOfSight: true, blocksEffect: false, door: true }] });
+    if (existing && existing.door) saveMap({ walls: walls.map((wl) => (wl.id === existing.id ? { ...wl, open: !wl.open } : wl)) });
+    else if (existing) saveMap({ walls: walls.map((wl) => (wl.id === existing.id ? { ...wl, door: true, open: false } : wl)) });
+    else saveMap({ walls: [...walls, { id: uid(), points: edge.points, blocksMovement: false, blocksLight: false, blocksLineOfSight: true, blocksEffect: false, door: true, open: false }] });
+  };
+  // Secret door: a GM-only passage that reads as a wall to players until opened.
+  const toggleSecret = (cx: number, cy: number) => {
+    if (!map) return;
+    const w = toWorld(cx, cy); if (!w) return;
+    const edge = nearestEdge(w.wx, w.wy);
+    const walls = map.walls ?? [];
+    const existing = walls.find((wl) => wallEdge(wl.points[0], wl.points[1]) === edge.key);
+    if (existing && existing.door) saveMap({ walls: walls.map((wl) => (wl.id === existing.id ? { ...wl, secret: !wl.secret } : wl)) });
+    else if (existing) saveMap({ walls: walls.map((wl) => (wl.id === existing.id ? { ...wl, door: true, open: false, secret: true } : wl)) });
+    else saveMap({ walls: [...walls, { id: uid(), points: edge.points, blocksMovement: false, blocksLight: false, blocksLineOfSight: true, blocksEffect: false, door: true, open: false, secret: true }] });
+  };
+  const removeDoorNear = (cx: number, cy: number) => {
+    if (!map) return;
+    const w = toWorld(cx, cy); if (!w) return;
+    const edge = nearestEdge(w.wx, w.wy);
+    saveMap({ walls: (map.walls ?? []).filter((wl) => wallEdge(wl.points[0], wl.points[1]) !== edge.key) });
   };
 
   const playerView = !isGm || viewAsPlayer;
@@ -544,6 +595,8 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
       wallStartRef.current = pointToIntersection(e.clientX, e.clientY);
     } else if (fogTool === "door") {
       toggleDoor(e.clientX, e.clientY);
+    } else if (fogTool === "secret") {
+      toggleSecret(e.clientX, e.clientY);
     }
   };
   const onFogPointerMove = (e: RPointerEvent<HTMLDivElement>) => {
@@ -558,7 +611,10 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
     }
     boxStartRef.current = null; wallStartRef.current = null; setBoxRect(null);
   };
-  const onFogDoubleClick = (e: RPointerEvent<HTMLDivElement>) => { if (fogTool === "wall") removeWallNear(e.clientX, e.clientY); };
+  const onFogDoubleClick = (e: RPointerEvent<HTMLDivElement>) => {
+    if (fogTool === "wall") removeWallNear(e.clientX, e.clientY);
+    else if (fogTool === "door" || fogTool === "secret") removeDoorNear(e.clientX, e.clientY);
+  };
 
   // ---- token drag (live-snap to whole cells) -------------------------------
   const onTokenPointerDown = (e: RPointerEvent<HTMLDivElement>, t: { entityId: Id; gx: number; gy: number }) => {
@@ -639,14 +695,15 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
   }, [drag, dragCell, dragPath, map, ruleset, unit]);
 
   // ---- lighting (sources, viewer perspective, wall-occluded illumination) --
+  const ambient = map?.ambient ?? "dark";
   const lightSources = useMemo(() => {
     if (!map) return [];
-    const arr: Array<{ gx: number; gy: number; shape: "radial" | "cone"; brightFt: number; dir?: number }> = [];
-    for (const L of map.lights ?? []) arr.push({ gx: L.gx, gy: L.gy, shape: L.shape, brightFt: L.brightFt, dir: L.dir });
+    const arr: Array<{ gx: number; gy: number; shape: "radial" | "cone"; brightFt: number; dir?: number; color: string }> = [];
+    for (const L of map.lights ?? []) arr.push({ gx: L.gx, gy: L.gy, shape: L.shape, brightFt: L.brightFt, dir: L.dir, color: L.color || "#f5a623" });
     for (const t of map.tokens) {
       const e = entityById.get(t.entityId);
       const ft = Number(e?.attributes.lightFt) || 0;
-      if (e && ft > 0) arr.push({ gx: t.gx, gy: t.gy, shape: e.attributes.lightCone ? "cone" : "radial", brightFt: ft, dir: Number(e.attributes.lightDir) || 0 });
+      if (e && ft > 0) arr.push({ gx: t.gx, gy: t.gy, shape: e.attributes.lightCone ? "cone" : "radial", brightFt: ft, dir: Number(e.attributes.lightDir) || 0, color: (e.attributes.lightColor as string) || "#f5a623" });
     }
     return arr;
   }, [map, entityById]);
@@ -660,14 +717,36 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
   }, [selected, entityById, map]);
   const lightWalls = useMemo(
     () => (map?.walls ?? []).filter((w) => w.points.length >= 2 && !doorOpen(w)).map((w) => [w.points[0], w.points[1]] as [[number, number], [number, number]]),
-    [map?.walls, map?.fog?.enabled, revealedSet]
+    [map?.walls]
   );
   const lighting = useMemo(() => {
     if (!showLight || !map) return null;
     const cols = Math.floor(map.width / map.grid.cellPx), rows = Math.floor(map.height / map.grid.cellPx);
     if (cols * rows === 0 || cols * rows > 3000) return null; // perf guard
-    return computeLighting({ sources: lightSources, viewer, walls: lightWalls, cols, rows, cellFt: map.grid.cellFt });
+    return computeLighting({ sources: lightSources, viewer, walls: lightWalls, cols, rows, cellFt: map.grid.cellFt, ambient });
+  }, [showLight, map, lightSources, viewer, lightWalls, ambient]);
+  // Per-source colored pools (cosmetic glow + flicker), wall- and FOV-accurate.
+  const lightGlows = useMemo(() => {
+    if (!showLight || !map || lightSources.length === 0 || lightSources.length > 8) return [];
+    const cols = Math.floor(map.width / map.grid.cellPx), rows = Math.floor(map.height / map.grid.cellPx);
+    if (cols * rows === 0 || cols * rows > 3000) return [];
+    return lightSources.map((s) => ({
+      color: s.color,
+      cells: computeLighting({ sources: [s], viewer, walls: lightWalls, cols, rows, cellFt: map.grid.cellFt, ambient: "dark" }),
+    }));
   }, [showLight, map, lightSources, viewer, lightWalls]);
+
+  // Movement range for the selected token: move / double / run, around walls.
+  const moveRange = useMemo(() => {
+    if (!showRange || !selected || !map) return null;
+    const e = entityById.get(selected);
+    const t = map.tokens.find((tt) => tt.entityId === selected);
+    if (!e || !t) return null;
+    const cols = Math.floor(map.width / map.grid.cellPx), rows = Math.floor(map.height / map.grid.cellPx);
+    if (cols * rows === 0 || cols * rows > 4000) return null;
+    const speed = Number(e.attributes.speedFt) || 30;
+    return { speed, cost: reachCostMap(t.gx, t.gy, speed * 4, cols, rows) };
+  }, [showRange, selected, map, entityById, moveBlocked]);
 
   // Token line-of-sight fog: while enabled (GM), each PC token reveals the cells
   // it can actually SEE — its light/darkvision FOV, blocked by walls (open doors
@@ -685,7 +764,7 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
       const seen = computeLighting({
         sources: lightSources,
         viewer: { gx: t.gx, gy: t.gy, lowLight: !!e.attributes.lowLight, darkvisionFt: Number(e.attributes.darkvisionFt) || 0 },
-        walls: lightWalls, cols, rows, cellFt: map.grid.cellFt,
+        walls: lightWalls, cols, rows, cellFt: map.grid.cellFt, ambient,
       });
       for (const k of seen.keys()) union.add(k);
     }
@@ -746,6 +825,8 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
       {/* toolbar: overlays + tokens */}
       <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, marginBottom: 8 }}>
         <button style={btn(C.text, showReach)} onClick={() => setShowReach((s) => !s)}>Reach {showReach ? "on" : "off"}</button>
+        <button style={btn(C.text, showRange)} onClick={() => setShowRange((s) => !s)} title="Show the selected token's movement range (move / double / run), around walls">Range {showRange ? "on" : "off"}</button>
+        <button style={btn(C.text, measure)} onClick={() => { const n = !measure; setMeasure(n); if (!n) setRuler(null); }} title="Measure distance: drag across the map (no token needed)">Measure {measure ? "on" : "off"}</button>
         {isGm && <>
           <span style={{ ...label, marginLeft: 6 }}>Fog:</span>
           <button style={btn(C.text, fog.enabled)} onClick={() => setFog({ enabled: !fog.enabled })}>{fog.enabled ? "On" : "Off"}</button>
@@ -763,7 +844,8 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
             {fogTool === "room" ? `Room: ${roomMode}` : "Room"}
           </button>
           <button style={btn(C.text, fogTool === "wall")} onClick={() => setFogTool((t) => (t === "wall" ? "off" : "wall"))} title="Drag along grid lines to add walls; double-click a wall to remove">Wall</button>
-          <button style={btn(C.text, fogTool === "door")} onClick={() => setFogTool((t) => (t === "door" ? "off" : "door"))} title="Click an edge to add a door (or remove one). Doors block sight but appear to players from a revealed side.">Door</button>
+          <button style={btn(C.text, fogTool === "door")} onClick={() => setFogTool((t) => (t === "door" ? "off" : "door"))} title="Click a door to open/close it (or add one on an edge). Double-click to remove. Closed doors block movement, light and sight.">Door</button>
+          <button style={btn(C.text, fogTool === "secret")} onClick={() => setFogTool((t) => (t === "secret" ? "off" : "secret"))} title="Secret door: looks like a wall to players until opened. Click an edge to add/toggle; double-click to remove.">Secret</button>
           <button style={btn(C.text, autoFog)} onClick={() => { const next = !autoFog; setAutoFog(next); if (next && !fog.enabled) setFog({ enabled: true }); }} title="Auto-reveal fog from each PC token's line of sight (light + vision, blocked by walls)">LoS fog</button>
           <button style={btn(C.dim)} onClick={revealAll}>Reveal all</button>
           <button style={btn(C.dim)} onClick={hideAll}>Hide all</button>
@@ -779,6 +861,12 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
           <span style={{ ...label, marginLeft: 6 }}>Light:</span>
           <button style={btn(C.text, showLight)} onClick={() => setShowLight((s) => !s)} title="Show wall-occluded illumination. Select a token to view from its perspective (low-light / darkvision).">{showLight ? "On" : "Off"}</button>
           {showLight && <button style={btn(C.gold)} onClick={addLight} title="Place an independent light source">+ Light</button>}
+          {showLight && <>
+            <span style={label}>Ambient</span>
+            {(["dark", "dim", "bright"] as const).map((a) => (
+              <button key={a} style={btn(C.text, ambient === a)} onClick={() => saveMap({ ambient: a })} title="Base light level for the whole map">{a}</button>
+            ))}
+          </>}
         </>}
         {unplaced.length > 0 && <>
           <span style={{ ...label, marginLeft: 6 }}>Place:</span>
@@ -983,6 +1071,47 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
             return <svg width={map.width} height={map.height} style={{ position: "absolute", left: 0, top: 0, pointerEvents: "none", zIndex: 8 }}>{rects}</svg>;
           })()}
 
+          {/* colored light pools (gentle flicker), wall- & FOV-accurate */}
+          {showLight && lightGlows.length > 0 && (
+            <>
+              <style>{"@keyframes cwtFlicker{0%,100%{opacity:1}25%{opacity:.86}50%{opacity:.95}75%{opacity:.83}}"}</style>
+              {lightGlows.map((gl, gi) => {
+                const rects: JSX.Element[] = [];
+                for (const [k, lvl] of gl.cells) {
+                  const [x, y] = k.split(",").map(Number);
+                  rects.push(<rect key={k} x={g.offsetX + x * g.cellPx} y={g.offsetY + y * g.cellPx} width={g.cellPx} height={g.cellPx} fill={gl.color} opacity={lvl === 2 ? 0.2 : 0.1} />);
+                }
+                return (
+                  <svg key={gi} width={map.width} height={map.height} style={{ position: "absolute", left: 0, top: 0, pointerEvents: "none", zIndex: 9, mixBlendMode: "screen", animation: `cwtFlicker ${2 + (gi % 4) * 0.5}s ease-in-out ${gi * 0.3}s infinite` }}>{rects}</svg>
+                );
+              })}
+            </>
+          )}
+
+          {/* movement range: move / double / run, around walls */}
+          {moveRange && (() => {
+            const rects: JSX.Element[] = [];
+            for (const [k, cost] of moveRange.cost) {
+              const [x, y] = k.split(",").map(Number);
+              const fill = cost <= moveRange.speed ? "#3fb950" : cost <= moveRange.speed * 2 ? "#d4af37" : "#d9844a";
+              rects.push(<rect key={k} x={g.offsetX + x * g.cellPx} y={g.offsetY + y * g.cellPx} width={g.cellPx} height={g.cellPx} fill={fill} opacity={0.16} />);
+            }
+            return <svg width={map.width} height={map.height} style={{ position: "absolute", left: 0, top: 0, pointerEvents: "none", zIndex: 7 }}>{rects}</svg>;
+          })()}
+
+          {/* ruler (Measure tool) */}
+          {ruler && (() => {
+            const ax = g.offsetX + (ruler.a.gx + 0.5) * g.cellPx, ay = g.offsetY + (ruler.a.gy + 0.5) * g.cellPx;
+            const bx = g.offsetX + (ruler.b.gx + 0.5) * g.cellPx, by = g.offsetY + (ruler.b.gy + 0.5) * g.cellPx;
+            return (
+              <svg width={map.width} height={map.height} style={{ position: "absolute", left: 0, top: 0, pointerEvents: "none", zIndex: 22 }}>
+                <line x1={ax} y1={ay} x2={bx} y2={by} stroke="#e6c84f" strokeWidth={3} strokeDasharray="7 5" strokeLinecap="round" />
+                <circle cx={ax} cy={ay} r={Math.max(3, g.cellPx * 0.1)} fill="#e6c84f" />
+                <circle cx={bx} cy={by} r={Math.max(3, g.cellPx * 0.1)} fill="#e6c84f" />
+              </svg>
+            );
+          })()}
+
           {/* independent light markers (GM, when lighting is on) */}
           {isGm && showLight && (map.lights ?? []).map((L) => {
             const pos = lightDrag?.id === L.id && lightPos ? lightPos : { gx: L.gx, gy: L.gy };
@@ -1026,15 +1155,19 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
                   return <line key={w.id} x1={g.offsetX + ax * g.cellPx} y1={g.offsetY + ay * g.cellPx} x2={g.offsetX + bx * g.cellPx} y2={g.offsetY + by * g.cellPx} stroke="#e8b54a" strokeWidth={4} strokeLinecap="round" opacity={0.95} />;
                 })}
                 {doors.map((w) => {
-                  if (playerView && !doorVisibleToPlayer(w)) return null;
+                  const open = doorOpen(w);
+                  // Players never see a secret door until it's opened (it reads as wall = invisible to them).
+                  if (playerView && w.secret && !open) return null;
+                  if (playerView && !open && !doorVisibleToPlayer(w)) return null;
                   const [[ax, ay], [bx, by]] = [w.points[0], w.points[1]];
                   const horizontal = ay === by;
                   const mx = g.offsetX + ((ax + bx) / 2) * g.cellPx;
                   const my = g.offsetY + ((ay + by) / 2) * g.cellPx;
                   const long = g.cellPx * 0.6, thick = Math.max(4, g.cellPx * 0.18);
                   const w_ = horizontal ? long : thick, h_ = horizontal ? thick : long;
-                  const open = doorOpen(w);
-                  return <rect key={w.id} x={mx - w_ / 2} y={my - h_ / 2} width={w_} height={h_} rx={2} fill={open ? "rgba(185,130,79,0.18)" : "#b9824f"} stroke="#f0dcae" strokeWidth={1.5} strokeDasharray={open ? "4 3" : undefined} />;
+                  const fill = open ? "rgba(185,130,79,0.18)" : w.secret ? "rgba(168,85,247,0.45)" : "#b9824f";
+                  const stroke = w.secret && !playerView ? "#c084fc" : "#f0dcae";
+                  return <rect key={w.id} x={mx - w_ / 2} y={my - h_ / 2} width={w_} height={h_} rx={2} fill={fill} stroke={stroke} strokeWidth={1.5} strokeDasharray={open || (w.secret && !playerView) ? "4 3" : undefined} />;
                 })}
                 {boxRect && (() => {
                   const x0 = Math.min(boxRect.x0, boxRect.x1), x1 = Math.max(boxRect.x0, boxRect.x1);
@@ -1062,6 +1195,11 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
         {/* drag distance readout */}
         {dragDistanceLabel && (
           <div style={{ position: "absolute", left: 10, bottom: 10, background: "rgba(10,12,17,0.85)", border: `1px solid ${C.border}`, color: C.gold, fontWeight: 800, fontSize: 13, padding: "4px 8px", borderRadius: 6, pointerEvents: "none" }}>{dragDistanceLabel}</div>
+        )}
+        {ruler && (
+          <div style={{ position: "absolute", left: 10, bottom: 10, background: "rgba(10,12,17,0.85)", border: `1px solid ${C.border}`, color: "#e6c84f", fontWeight: 800, fontSize: 13, padding: "4px 8px", borderRadius: 6, pointerEvents: "none" }}>
+            📏 {formatDistance(ruleset.measureDistanceFt({ x: ruler.a.gx, y: ruler.a.gy }, { x: ruler.b.gx, y: ruler.b.gy }), { unit })}
+          </div>
         )}
 
         {/* AoE editor */}
@@ -1126,6 +1264,8 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
                 <span style={{ ...label, width: 34 }}>{Math.round(selectedLight.dir ?? 0)}°</span>
               </>
             )}
+            <span style={label}>Color</span>
+            <input type="color" value={toHex(selectedLight.color || "#f5a623")} onChange={(e) => updateLight(selectedLight.id, { color: e.target.value })} style={{ width: 30, height: 24, padding: 0, border: `1px solid ${C.border}`, background: "transparent" }} />
             <button style={{ ...btn("#fff"), background: "#d9544a", border: "1px solid #d9544a" }} onClick={() => removeLight(selectedLight.id)}>Delete</button>
           </div>
         )}
@@ -1152,6 +1292,27 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
               <span style={{ ...label, marginLeft: 6 }}>Vision</span>
               <button style={btn(C.text, !!selEntity.attributes.lowLight)} onClick={() => setEntityAttr(selEntity, { lowLight: !selEntity.attributes.lowLight })} title="Doubles the bright & shadowy range of every light (from this token's view)">Low-light</button>
               <button style={btn(C.text, dv > 0)} onClick={() => setEntityAttr(selEntity, { darkvisionFt: dv > 0 ? 0 : 60 })} title="Sees its own radius as bright, even in darkness">Darkvision 60</button>
+              {lf > 0 && <>
+                <span style={label}>Color</span>
+                <input type="color" value={toHex((selEntity.attributes.lightColor as string) || "#f5a623")} onChange={(e) => setEntityAttr(selEntity, { lightColor: e.target.value })} style={{ width: 30, height: 24, padding: 0, border: `1px solid ${C.border}`, background: "transparent" }} />
+              </>}
+            </div>
+          );
+        })()}
+
+        {/* movement range editor (speed + legend) */}
+        {showRange && selEntity && (() => {
+          const speed = Number(selEntity.attributes.speedFt) || 30;
+          const chip = (c: string, t: string) => <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}><span style={{ width: 11, height: 11, borderRadius: 2, background: c, display: "inline-block" }} />{t}</span>;
+          return (
+            <div onPointerDown={(e) => e.stopPropagation()}
+              style={{ position: "absolute", top: 10, left: 10, zIndex: 55, background: C.panel, border: `1px solid ${C.border}`, borderRadius: 9, padding: "8px 10px", display: "flex", alignItems: "center", gap: 8, boxShadow: "0 8px 24px rgba(0,0,0,0.5)", flexWrap: "wrap" }}>
+              <span style={{ color: C.gold, fontWeight: 800, fontSize: 12 }}>Move</span>
+              <span style={label}>Speed</span>
+              <input type="number" min={5} step={5} value={speed} onChange={(e) => setEntityAttr(selEntity, { speedFt: Math.max(5, Number(e.target.value) || 30) })}
+                style={{ width: 52, background: C.panel, color: C.text, border: `1px solid ${C.border}`, borderRadius: 5, padding: "3px 5px" }} />
+              <span style={label}>ft</span>
+              <span style={{ ...label, display: "flex", gap: 10 }}>{chip("#3fb950", "move")}{chip("#d4af37", "double")}{chip("#d9844a", "run")}</span>
             </div>
           );
         })()}

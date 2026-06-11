@@ -22,7 +22,9 @@ only when the Supabase env vars are present (see STEP5-SUPABASE.md).
 npm install
 npm run dev        # dev server with hot reload
 npm run build      # production build into dist/
-npm run typecheck  # tsc --noEmit (no local lint/test gate yet)
+npm run typecheck  # tsc --noEmit
+npm test           # vitest run (pure-engine tests)
+npm run test:watch # vitest in watch mode
 ```
 
 The header shows a `LOCAL` / `CLOUD` badge so you always know which backend is active.
@@ -60,9 +62,9 @@ terminal; otherwise paste in the files shared here. Each source file's first lin
 `// path` comment marking where it belongs relative to the project root.
 
 ## Type checking & conventions
-- `npm run typecheck` runs `tsc --noEmit` (strict). There is no ESLint/Vitest gate yet;
-  adding Vitest tests for the pure geometry (`aoeCells`, `reachCells`, stacking, grid
-  detection, and the `lighting` raycast) is the recommended next quality step.
+- `npm run typecheck` runs `tsc --noEmit` (strict). `npm test` runs Vitest over the
+  pure engines (`aoeCells`, `reachCells`, `measureDistanceFt`, and the `lighting`
+  raycast); both run in CI before every deploy. There is no ESLint gate yet.
 - This app uses the modern JSX transform: import React types directly
   (`import type { CSSProperties } from "react"`), not via the `React.` namespace.
 - Styling is inline (no CSS compiler). Icons are `lucide-react`; conditions also use

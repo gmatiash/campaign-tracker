@@ -124,19 +124,23 @@ supabase/
   membership table already support it (the app currently pins a single `camp-1`).
 - **Second rule system** → add `systems/<name>/` implementing `Ruleset`; validates the
   abstraction without touching modules.
-- **Geometry tests** → `aoeCells`, `reachCells`, stacking, `gridDetect`, and `lighting` are
-  pure functions ready for a Vitest + CI typecheck gate.
+- **Geometry tests** → `aoeCells`, `reachCells`, `measureDistanceFt`, and `lighting` have
+  Vitest coverage; CI runs typecheck + tests before every deploy. Stacking and
+  `gridDetect` remain to cover.
 
 ## Status
 Done: modular TS core; D&D 3.5e ruleset; IndexedDB local-first + JSON export/import;
 Supabase cloud (auth, realtime, RLS) + member roles + invite; battle map with tokens,
 colors, portraits, conditions/damage on tokens, same-cell stacking, dead/unconscious
-state; ft ↔ m unit switch; wall-aware movement with path tracing; AoE templates + effects
-(presets and tiled images); reach overlay + reach weapons; dynamic lighting & vision
-(radial/cone, low-light, darkvision, wall occlusion, selection-aware FOV); fog of war with
-manual tools + token line-of-sight auto-reveal; walls + contextual doors; turn flow with
-shared Scene state + Undo; New combat / Reset to demo; Supabase Storage for images;
-in-browser grid auto-detection.
+state; ft ↔ m unit switch; wall-aware movement with path tracing; speed-based movement
+range (move/double/run); standalone ruler; AoE templates + effects (presets and tiled
+images); reach overlay + reach weapons; dynamic lighting & vision (radial/cone, low-light,
+darkvision, wall occlusion, selection-aware FOV, ambient light level, light colour +
+flicker); fog of war with manual tools + token line-of-sight auto-reveal; walls +
+open/closed doors + secret doors; conditions with round durations; turn flow with shared
+Scene state + Undo; New combat / Reset to demo; Supabase Storage for images; in-browser
+grid auto-detection; Vitest + CI typecheck/test gate.
 
-Not yet: true server-side secrecy, multi-campaign UI, a second rule system, AI map/wall
-generation, automated tests.
+Not yet: map/scene library, GM ping & annotation layer, per-player token control + personal
+vision, true server-side secrecy, multi-campaign UI, a second rule system, AI map/wall
+generation.

@@ -46,6 +46,8 @@ export interface Wall {
   blocksLineOfSight: boolean;
   blocksEffect: boolean;
   door?: boolean; // a door: blocks like a wall but is shown to players from a revealed side
+  open?: boolean; // door state: open doors pass movement, light and sight
+  secret?: boolean; // GM-only door: looks like a wall to players until opened
 }
 
 export interface LightSource {
@@ -75,6 +77,7 @@ export interface MapDoc extends BaseRecord {
   aoeTemplates: AoeTemplate[];
   walls: Wall[];
   lights?: LightSource[];
+  ambient?: "bright" | "dim" | "dark"; // base illumination floor (default "dark")
   fog?: FogState;
 }
 
