@@ -17,6 +17,7 @@ import { clearHistory } from "../modules/combat/turnHistory";
 import MapView from "../modules/map/MapView";
 import MembersPanel from "./MembersPanel";
 import InvitePanel from "./InvitePanel";
+import GuidePanel from "./GuidePanel";
 import SignIn from "./auth/SignIn";
 import { useSession } from "./auth/useSession";
 
@@ -124,6 +125,7 @@ function MainApp({ ownerId, userLabel, onSignOut }: { ownerId: Id; userLabel?: s
   const ruleset = useMemo(() => getRuleset(DEMO_RULESET_ID), []);
   const fileRef = useRef<HTMLInputElement>(null);
   const [isGm, setIsGm] = useState<boolean>(!cloud);
+  const [showGuide, setShowGuide] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -171,6 +173,7 @@ function MainApp({ ownerId, userLabel, onSignOut }: { ownerId: Id; userLabel?: s
           {cloud ? "CLOUD" : "LOCAL"}
         </span>
         {userLabel && <span style={{ fontSize: 11, color: "#99a0b0" }}>{userLabel}</span>}
+        <button style={{ ...btnStyle, color: "#d4af37", borderColor: "#d4af3766" }} onClick={() => setShowGuide(true)}>Guide</button>
         <button style={btnStyle} onClick={onExport}>Export backup</button>
         <label style={btnStyle}>
           Import backup
@@ -190,6 +193,7 @@ function MainApp({ ownerId, userLabel, onSignOut }: { ownerId: Id; userLabel?: s
       {cloud && <MembersPanel campaignId={CAMPAIGN_ID} currentUserId={ownerId} />}
       <MapView repo={repo} ruleset={ruleset} campaignId={CAMPAIGN_ID} mapId={MAP_ID} sceneId={SCENE_ID} isGm={isGm} />
       <CombatTracker repo={repo} ruleset={ruleset} campaignId={CAMPAIGN_ID} sceneId={SCENE_ID} ownerId={ownerId} />
+      {showGuide && <GuidePanel isGm={isGm} onClose={() => setShowGuide(false)} />}
     </div>
   );
 }

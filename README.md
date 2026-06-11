@@ -136,6 +136,9 @@ supabase/                    # schema.sql + 02_members.sql + 03_storage.sql
 ```
 
 ## Guides
+- **[PLAYER-GUIDE.md](./PLAYER-GUIDE.md)** — for players: reading the map and combat.
+- **[GM-GUIDE.md](./GM-GUIDE.md)** — for Game Masters: the full toolset.
+  *(Both are also available in-app via the **Guide** button in the header.)*
 - **[ARCHITECTURE.md](./ARCHITECTURE.md)** — design pillars, data model, and where
   each feature attaches.
 - **[STEP1-SETUP.md](./STEP1-SETUP.md)** — local setup & development.
