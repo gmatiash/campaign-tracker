@@ -136,6 +136,7 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
   const [roomMode, setRoomMode] = useState<"reveal" | "hide">("reveal");
   const [viewAsPlayer, setViewAsPlayer] = useState(false);
   const [showLight, setShowLight] = useState(false);
+  const [autoFog, setAutoFog] = useState(false);
   const [selLight, setSelLight] = useState<Id | null>(null);
   const [lightDrag, setLightDrag] = useState<{ id: Id; baseGx: number; baseGy: number; startX: number; startY: number; startScale: number } | null>(null);
   const [lightPos, setLightPos] = useState<{ gx: number; gy: number } | null>(null);
@@ -668,6 +669,32 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
     return computeLighting({ sources: lightSources, viewer, walls: lightWalls, cols, rows, cellFt: map.grid.cellFt });
   }, [showLight, map, lightSources, viewer, lightWalls]);
 
+  // Token line-of-sight fog: while enabled (GM), each PC token reveals the cells
+  // it can actually SEE — its light/darkvision FOV, blocked by walls (open doors
+  // let sight through). Reveals are additive (explored map stays revealed); the
+  // lighting overlay separately dims what isn't currently lit.
+  useEffect(() => {
+    if (!autoFog || !isGm || !map || !map.fog?.enabled) return;
+    const cols = Math.floor(map.width / map.grid.cellPx), rows = Math.floor(map.height / map.grid.cellPx);
+    if (cols * rows === 0 || cols * rows > 3000) return;
+    const union = new Set<string>();
+    for (const t of map.tokens) {
+      const e = entityById.get(t.entityId);
+      if (!e || e.kind !== "pc") continue;
+      union.add(`${t.gx},${t.gy}`); // a token always knows its own square
+      const seen = computeLighting({
+        sources: lightSources,
+        viewer: { gx: t.gx, gy: t.gy, lowLight: !!e.attributes.lowLight, darkvisionFt: Number(e.attributes.darkvisionFt) || 0 },
+        walls: lightWalls, cols, rows, cellFt: map.grid.cellFt,
+      });
+      for (const k of seen.keys()) union.add(k);
+    }
+    const existing = new Set((map.fog.revealed ?? []).map(([x, y]) => `${x},${y}`));
+    let added = false;
+    for (const k of union) if (!existing.has(k)) { existing.add(k); added = true; }
+    if (added) setFog({ revealed: fromKeys(existing) });
+  }, [autoFog, isGm, map, lightSources, lightWalls, entityById]);
+
   // ---- styles --------------------------------------------------------------
   const btn = (color: string, on = false): CSSProperties => ({
     background: on ? "rgba(212,175,55,0.18)" : C.row, border: `1px solid ${on ? C.gold : C.border}`,
@@ -737,6 +764,7 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
           </button>
           <button style={btn(C.text, fogTool === "wall")} onClick={() => setFogTool((t) => (t === "wall" ? "off" : "wall"))} title="Drag along grid lines to add walls; double-click a wall to remove">Wall</button>
           <button style={btn(C.text, fogTool === "door")} onClick={() => setFogTool((t) => (t === "door" ? "off" : "door"))} title="Click an edge to add a door (or remove one). Doors block sight but appear to players from a revealed side.">Door</button>
+          <button style={btn(C.text, autoFog)} onClick={() => { const next = !autoFog; setAutoFog(next); if (next && !fog.enabled) setFog({ enabled: true }); }} title="Auto-reveal fog from each PC token's line of sight (light + vision, blocked by walls)">LoS fog</button>
           <button style={btn(C.dim)} onClick={revealAll}>Reveal all</button>
           <button style={btn(C.dim)} onClick={hideAll}>Hide all</button>
           <button style={btn(C.gold, viewAsPlayer)} onClick={() => setViewAsPlayer((v) => !v)} title="Preview exactly what players see">{viewAsPlayer ? "Player view" : "View as player"}</button>

@@ -26,7 +26,9 @@ Open **SQL Editor → New query**, paste each file, and run **in order**:
    `campaign-images` bucket and a write policy (see Storage below).
 
 Each file is idempotent; re-running is safe. An "already member of publication" notice
-on re-run is harmless.
+on re-run is harmless. Because every record's payload is a single **JSONB** column, app
+features (maps, tokens, lights, vision, AoE effects, fog, the unit preference) are stored
+without their own columns — adding a feature never requires a schema migration.
 
 ## 3. Configure auth (magic link)
 1. **Authentication → Providers → Email**: keep **Email** enabled. The app uses a

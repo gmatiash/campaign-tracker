@@ -46,11 +46,11 @@ campaign-tracker/
    │  ├─ domain/           # rules-agnostic models + entity factory
    │  ├─ ruleset/          # the Ruleset plugin contract + registry
    │  ├─ persistence/      # Repository + memory / indexeddb / supabase + io
-   │  ├─ units.ts  assets.ts  gridDetect.ts
+   │  ├─ units.ts  assets.ts  gridDetect.ts  lighting.ts
    ├─ systems/             # index.ts + dnd35/ (the only D&D-specific code)
    └─ modules/
       ├─ combat/           # CombatTracker + turnHistory (Undo)
-      └─ map/              # MapView (grid, tokens, AoE, reach, fog/walls)
+      └─ map/              # MapView (grid, tokens, movement, AoE, reach, lighting, fog/walls)
 ```
 
 ## Editing the code with an AI assistant
@@ -62,7 +62,7 @@ terminal; otherwise paste in the files shared here. Each source file's first lin
 ## Type checking & conventions
 - `npm run typecheck` runs `tsc --noEmit` (strict). There is no ESLint/Vitest gate yet;
   adding Vitest tests for the pure geometry (`aoeCells`, `reachCells`, stacking, grid
-  detection) is the recommended next quality step.
+  detection, and the `lighting` raycast) is the recommended next quality step.
 - This app uses the modern JSX transform: import React types directly
   (`import type { CSSProperties } from "react"`), not via the `React.` namespace.
 - Styling is inline (no CSS compiler). Icons are `lucide-react`; conditions also use
