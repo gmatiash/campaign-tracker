@@ -93,5 +93,17 @@ export function computeLighting(input: LightingInput): Map<string, 1 | 2> {
     // darkvision: own radius reads as bright regardless of lights
     cast(viewer.gx, viewer.gy, viewer.darkvisionFt, viewer.darkvisionFt, null);
   }
+
+  // Viewer field of view: a token only perceives illuminated cells it can actually
+  // SEE — drop any lit cell whose line of sight from the viewer is blocked by a
+  // wall. (Without a viewer this is the GM "god view": full illumination.)
+  if (viewer) {
+    const vx = viewer.gx + 0.5, vy = viewer.gy + 0.5;
+    for (const k of [...out.keys()]) {
+      const ci = k.indexOf(",");
+      const x = Number(k.slice(0, ci)), y = Number(k.slice(ci + 1));
+      if (blocked(vx, vy, x + 0.5, y + 0.5)) out.delete(k);
+    }
+  }
   return out;
 }

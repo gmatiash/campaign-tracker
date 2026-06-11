@@ -347,6 +347,18 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
     return s;
   }, [map?.walls]);
 
+  // A door counts as OPEN (lets light & sight pass) when both cells it separates
+  // are revealed — or when fog is off (the whole map is "seen").
+  const doorOpen = (w: Wall): boolean => {
+    if (!w.door || w.points.length < 2) return false;
+    if (!map?.fog?.enabled) return true;
+    const [ax, ay] = w.points[0], [bx, by] = w.points[1];
+    const cells = ay === by
+      ? [[Math.min(ax, bx), ay - 1], [Math.min(ax, bx), ay]]
+      : [[ax - 1, Math.min(ay, by)], [ax, Math.min(ay, by)]];
+    return revealedSet.has(`${cells[0][0]},${cells[0][1]}`) && revealedSet.has(`${cells[1][0]},${cells[1][1]}`);
+  };
+
   const PATH_LIMIT = 4000; // skip pathfinding on very large grids (perf)
   const stepAllowed = (x: number, y: number, nx: number, ny: number): boolean => {
     const dx = nx - x, dy = ny - y;
@@ -643,14 +655,11 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
     const e = entityById.get(selected);
     const t = map.tokens.find((tt) => tt.entityId === selected);
     if (!e || !t) return null;
-    const lowLight = !!e.attributes.lowLight;
-    const darkvisionFt = Number(e.attributes.darkvisionFt) || 0;
-    if (!lowLight && !darkvisionFt) return null;
-    return { gx: t.gx, gy: t.gy, lowLight, darkvisionFt };
+    return { gx: t.gx, gy: t.gy, lowLight: !!e.attributes.lowLight, darkvisionFt: Number(e.attributes.darkvisionFt) || 0 };
   }, [selected, entityById, map]);
   const lightWalls = useMemo(
-    () => (map?.walls ?? []).filter((w) => w.points.length >= 2).map((w) => [w.points[0], w.points[1]] as [[number, number], [number, number]]),
-    [map?.walls]
+    () => (map?.walls ?? []).filter((w) => w.points.length >= 2 && !doorOpen(w)).map((w) => [w.points[0], w.points[1]] as [[number, number], [number, number]]),
+    [map?.walls, map?.fog?.enabled, revealedSet]
   );
   const lighting = useMemo(() => {
     if (!showLight || !map) return null;
@@ -869,6 +878,15 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
                     if (isRevealed(gx + dx, gy + dy)) anyVisible = true;
                 if (!anyVisible) return null;
               }
+              // When previewing a selected token's vision (Light on), hide tokens it
+              // can't see — a lit cell behind a wall is outside its line of sight.
+              if (showLight && viewer && lighting && t.entityId !== selected) {
+                let seen = false;
+                for (let dx = 0; dx < sd.footprint && !seen; dx++)
+                  for (let dy = 0; dy < sd.footprint && !seen; dy++)
+                    if (lighting.has(`${gx + dx},${gy + dy}`)) seen = true;
+                if (!seen) return null;
+              }
               const box = sd.footprint * g.cellPx, dia = box * sd.scale;
               const accent = e.color || (e.kind === "pc" ? C.pc : C.npc);
               const isSel = selected === t.entityId;
@@ -987,7 +1005,8 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
                   const my = g.offsetY + ((ay + by) / 2) * g.cellPx;
                   const long = g.cellPx * 0.6, thick = Math.max(4, g.cellPx * 0.18);
                   const w_ = horizontal ? long : thick, h_ = horizontal ? thick : long;
-                  return <rect key={w.id} x={mx - w_ / 2} y={my - h_ / 2} width={w_} height={h_} rx={2} fill="#b9824f" stroke="#f0dcae" strokeWidth={1.5} />;
+                  const open = doorOpen(w);
+                  return <rect key={w.id} x={mx - w_ / 2} y={my - h_ / 2} width={w_} height={h_} rx={2} fill={open ? "rgba(185,130,79,0.18)" : "#b9824f"} stroke="#f0dcae" strokeWidth={1.5} strokeDasharray={open ? "4 3" : undefined} />;
                 })}
                 {boxRect && (() => {
                   const x0 = Math.min(boxRect.x0, boxRect.x1), x1 = Math.max(boxRect.x0, boxRect.x1);
