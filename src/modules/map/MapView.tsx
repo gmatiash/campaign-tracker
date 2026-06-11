@@ -132,7 +132,7 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
   const [tplDrag, setTplDrag] = useState<TplDrag | null>(null);
   const [tplOrigin, setTplOrigin] = useState<{ ix: number; iy: number } | null>(null);
   const [showReach, setShowReach] = useState(false);
-  const [fogTool, setFogTool] = useState<"off" | "reveal" | "hide" | "room" | "wall" | "door" | "secret">("off");
+  const [fogTool, setFogTool] = useState<"off" | "reveal" | "hide" | "room" | "wall" | "door" | "secret" | "erase">("off");
   const [roomMode, setRoomMode] = useState<"reveal" | "hide">("reveal");
   const [viewAsPlayer, setViewAsPlayer] = useState(false);
   const [showLight, setShowLight] = useState(false);
@@ -370,9 +370,16 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
   const stepAllowed = (x: number, y: number, nx: number, ny: number): boolean => {
     const dx = nx - x, dy = ny - y;
     if (dx && dy) {
-      const v = dx > 0 ? `V:${x + 1}:${y}` : `V:${x}:${y}`;
-      const h = dy > 0 ? `H:${x}:${y + 1}` : `H:${x}:${y}`;
-      return !moveBlocked.has(v) && !moveBlocked.has(h); // no cutting wall corners
+      // The two ways to walk the diagonal are A→(nx,y)→B and A→(x,ny)→B. Allow the
+      // diagonal only if a whole L-route is clear. This is symmetric (same four edges
+      // regardless of direction) and blocks slipping diagonally across a wall.
+      const aC1 = dx > 0 ? `V:${x + 1}:${y}` : `V:${x}:${y}`;     // A → (nx,y)
+      const c1B = `H:${nx}:${dy > 0 ? y + 1 : y}`;                 // (nx,y) → B
+      const aC2 = `H:${x}:${dy > 0 ? y + 1 : y}`;                  // A → (x,ny)
+      const c2B = dx > 0 ? `V:${x + 1}:${ny}` : `V:${x}:${ny}`;    // (x,ny) → B
+      const route1 = !moveBlocked.has(aC1) && !moveBlocked.has(c1B);
+      const route2 = !moveBlocked.has(aC2) && !moveBlocked.has(c2B);
+      return route1 || route2;
     }
     if (dx) return !moveBlocked.has(dx > 0 ? `V:${x + 1}:${y}` : `V:${x}:${y}`);
     return !moveBlocked.has(dy > 0 ? `H:${x}:${y + 1}` : `H:${x}:${y}`);
@@ -597,6 +604,8 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
       toggleDoor(e.clientX, e.clientY);
     } else if (fogTool === "secret") {
       toggleSecret(e.clientX, e.clientY);
+    } else if (fogTool === "erase") {
+      removeWallNear(e.clientX, e.clientY);
     }
   };
   const onFogPointerMove = (e: RPointerEvent<HTMLDivElement>) => {
@@ -846,6 +855,7 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
           <button style={btn(C.text, fogTool === "wall")} onClick={() => setFogTool((t) => (t === "wall" ? "off" : "wall"))} title="Drag along grid lines to add walls; double-click a wall to remove">Wall</button>
           <button style={btn(C.text, fogTool === "door")} onClick={() => setFogTool((t) => (t === "door" ? "off" : "door"))} title="Click a door to open/close it (or add one on an edge). Double-click to remove. Closed doors block movement, light and sight.">Door</button>
           <button style={btn(C.text, fogTool === "secret")} onClick={() => setFogTool((t) => (t === "secret" ? "off" : "secret"))} title="Secret door: looks like a wall to players until opened. Click an edge to add/toggle; double-click to remove.">Secret</button>
+          <button style={btn(C.danger, fogTool === "erase")} onClick={() => setFogTool((t) => (t === "erase" ? "off" : "erase"))} title="Click a wall or door to delete it.">Erase</button>
           <button style={btn(C.text, autoFog)} onClick={() => { const next = !autoFog; setAutoFog(next); if (next && !fog.enabled) setFog({ enabled: true }); }} title="Auto-reveal fog from each PC token's line of sight (light + vision, blocked by walls)">LoS fog</button>
           <button style={btn(C.dim)} onClick={revealAll}>Reveal all</button>
           <button style={btn(C.dim)} onClick={hideAll}>Hide all</button>
@@ -1094,9 +1104,9 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
             for (const [k, cost] of moveRange.cost) {
               const [x, y] = k.split(",").map(Number);
               const fill = cost <= moveRange.speed ? "#3fb950" : cost <= moveRange.speed * 2 ? "#d4af37" : "#d9844a";
-              rects.push(<rect key={k} x={g.offsetX + x * g.cellPx} y={g.offsetY + y * g.cellPx} width={g.cellPx} height={g.cellPx} fill={fill} opacity={0.16} />);
+              rects.push(<rect key={k} x={g.offsetX + x * g.cellPx} y={g.offsetY + y * g.cellPx} width={g.cellPx} height={g.cellPx} fill={fill} opacity={0.38} />);
             }
-            return <svg width={map.width} height={map.height} style={{ position: "absolute", left: 0, top: 0, pointerEvents: "none", zIndex: 7 }}>{rects}</svg>;
+            return <svg width={map.width} height={map.height} style={{ position: "absolute", left: 0, top: 0, pointerEvents: "none", zIndex: 9 }}>{rects}</svg>;
           })()}
 
           {/* ruler (Measure tool) */}
