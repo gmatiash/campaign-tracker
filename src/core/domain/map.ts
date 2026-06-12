@@ -48,6 +48,7 @@ export interface Wall {
   door?: boolean; // a door: blocks like a wall but is shown to players from a revealed side
   open?: boolean; // door state: open doors pass movement, light and sight
   secret?: boolean; // GM-only door: looks like a wall to players until opened
+  label?: string; // short non-sequential code shown on doors so the GM can identify them
 }
 
 export interface LightSource {
@@ -61,9 +62,9 @@ export interface LightSource {
 }
 
 export interface FogState {
-  // [future] player-specific reveal is enforced server-side (RLS)
   enabled: boolean;
   revealed: Array<[number, number]>;
+  los?: boolean; // line-of-sight mode: render only what the party currently sees
 }
 
 export interface MapDoc extends BaseRecord {

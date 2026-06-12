@@ -125,7 +125,8 @@ const GM: Section[] = [
       "The header badge shows CLOUD (synced, multiplayer) or LOCAL (this browser only).",
       "Invite (cloud) shares the campaign link; Members manages player/GM roles.",
       "Export / Import backs up and restores the whole campaign as JSON, in any mode.",
-      "Streaming — hide the toolbars from players by sharing only the map area, and use View as player to confirm what they'll see.",
+      "Streaming (two screens) — sign the shared screen in as a player and turn on View as player, so it shows only what players should see; share that screen on Discord.",
+      "GM Control — tap GM Control in the header (best on your phone) to run turn order, ambient light, fog, and doors from a simple panel while the map is shared from the other screen. Changes sync live.",
     ],
   },
 ];

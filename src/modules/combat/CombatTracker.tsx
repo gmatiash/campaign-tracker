@@ -7,6 +7,7 @@ import { fileToImageAsset, removeImage } from "../../core/assets";
 import type { Repository } from "../../core/persistence/repository";
 import type { Ruleset } from "../../core/ruleset/ruleset";
 import { pushSnapshot, undoSnapshot, clearHistory, historyDepth } from "./turnHistory";
+import { playerVisibleCells, entityVisibleToPlayers } from "../../core/fog";
 
 const C = {
   panel: "#13161f", row: "#1a1e29", border: "#2b3142", text: "#e9e3d4",
@@ -27,6 +28,8 @@ interface Props {
   campaignId: Id;
   sceneId: Id;
   ownerId: Id;
+  mapId?: Id;
+  isGm?: boolean;
 }
 
 /**
@@ -34,10 +37,11 @@ interface Props {
  * sizes come from `ruleset`; all reads/writes go through `repo`. Round and active
  * turn live on the shared Scene record, so the map view reflects the same state.
  */
-export default function CombatTracker({ repo, ruleset, campaignId, sceneId, ownerId }: Props) {
+export default function CombatTracker({ repo, ruleset, campaignId, sceneId, ownerId, mapId, isGm = true }: Props) {
   const [entities, setEntities] = useState<Entity[]>([]);
   const [scenes, setScenes] = useState<Scene[]>([]);
   const [assets, setAssets] = useState<Asset[]>([]);
+  const [maps, setMaps] = useState<MapDoc[]>([]);
   const [dmg, setDmg] = useState<Record<Id, string>>({});
   const [newName, setNewName] = useState("");
   const [histCount, setHistCount] = useState(historyDepth());
@@ -45,6 +49,7 @@ export default function CombatTracker({ repo, ruleset, campaignId, sceneId, owne
   useEffect(() => repo.subscribe<Entity>("entities", { campaignId }, setEntities), [repo, campaignId]);
   useEffect(() => repo.subscribe<Scene>("scenes", { campaignId }, setScenes), [repo, campaignId]);
   useEffect(() => repo.subscribe<Asset>("assets", { campaignId }, setAssets), [repo, campaignId]);
+  useEffect(() => repo.subscribe<MapDoc>("maps", { campaignId }, setMaps), [repo, campaignId]);
 
   const scene = useMemo(() => scenes.find((s) => s.id === sceneId) ?? null, [scenes, sceneId]);
   const round = scene?.round ?? 1;
@@ -57,12 +62,33 @@ export default function CombatTracker({ repo, ruleset, campaignId, sceneId, owne
   const initOf = (e: Entity) => num(e.attributes.initiative);
   const ordered = useMemo(() => [...entities].sort((a, b) => initOf(b) - initOf(a)), [entities]);
 
+  // Turn order uses every combatant; the visible list hides NPCs a player can't see
+  // (out of sight, or marked hidden by the GM).
+  const entityById = useMemo(() => new Map(entities.map((e) => [e.id, e] as const)), [entities]);
+  const map = useMemo(() => maps.find((m) => m.id === mapId) ?? null, [maps, mapId]);
+  const visibleCells = useMemo(() => (map ? playerVisibleCells(map, entityById) : null), [map, entityById]);
+  const displayed = useMemo(
+    () => (isGm || !map ? ordered : ordered.filter((e) => e.kind !== "npc" || entityVisibleToPlayers(e, map, visibleCells))),
+    [isGm, map, ordered, visibleCells]
+  );
+
   const save = (e: Entity, attrs: Record<string, unknown>, top: Partial<Entity> = {}) =>
     repo.put<Entity>("entities", { ...e, ...top, attributes: { ...e.attributes, ...attrs } });
   const saveScene = (patch: Partial<Scene>) => { if (scene) repo.put<Scene>("scenes", { ...scene, ...patch }); };
 
   const roll = (e: Entity) => save(e, { initiative: ruleset.rollInitiative(e) });
-  const rollAllNpcs = () => ordered.filter((e) => e.kind === "npc").forEach(roll);
+  const rollAllNpcs = () => {
+    const npcs = ordered.filter((e) => e.kind === "npc");
+    if (!npcs.length) return;
+    const rolls = npcs.map((e) => ({ e, init: ruleset.rollInitiative(e) }));
+    const zeros = rolls.filter((r) => r.init === 0);
+    if (zeros.length) {
+      const ok = window.confirm(`${zeros.length} NPC(s) rolled an initiative of 0. Click OK to roll new values for them, or Cancel to abort.`);
+      if (!ok) return;
+      for (const r of zeros) { let v = 0; for (let t = 0; t < 20 && v === 0; t++) v = ruleset.rollInitiative(r.e); r.init = v; }
+    }
+    rolls.forEach((r) => save(r.e, { initiative: r.init }));
+  };
 
   const addCombatant = (kind: "pc" | "npc") => {
     const name = newName.trim() || (kind === "pc" ? "New PC" : "New NPC");
@@ -139,22 +165,31 @@ export default function CombatTracker({ repo, ruleset, campaignId, sceneId, owne
     setHistCount(historyDepth());
   };
 
-  // Start a fresh encounter: drop NPCs, clear the board and per-encounter state,
-  // keep the party (PCs) and the campaign. (Cloud: GM-only, enforced by RLS.)
+  // Start a fresh encounter: drop NPCs and clear the terrain (AoE, walls, lights,
+  // map image), but keep the party's tokens on the board. With LoS fog on, the blank
+  // map starts fully fogged and vision reveals around the PCs; otherwise fog stays off.
   const resetCombat = async () => {
-    if (!window.confirm("Start a new combat? This deletes all NPCs, clears the board (tokens, AoE templates, map image), resets damage, conditions and the round. Player characters are kept.")) return;
+    if (!window.confirm("Start a new combat? This deletes all NPCs and clears the board (area effects, walls, lights, map image), and resets damage, conditions and the round. The party's tokens are kept.")) return;
     try {
+      const pcIds = new Set(entities.filter((x) => x.kind === "pc").map((e) => e.id));
       for (const e of entities.filter((x) => x.kind === "npc")) await repo.remove("entities", e.id);
       for (const e of entities.filter((x) => x.kind !== "npc")) {
         await repo.put<Entity>("entities", { ...e, attributes: { ...e.attributes, damage: 0, initiative: 0, conditionRounds: {} }, conditions: [] });
       }
-      const maps = await repo.list<MapDoc>("maps", { campaignId });
-      for (const m of maps) {
+      const allMaps = await repo.list<MapDoc>("maps", { campaignId });
+      for (const m of allMaps) {
         if (m.backgroundAssetId) {
           await removeImage(await repo.get<Asset>("assets", m.backgroundAssetId));
           await repo.remove("assets", m.backgroundAssetId).catch(() => undefined);
         }
-        await repo.put<MapDoc>("maps", { ...m, tokens: [], aoeTemplates: [], walls: [], lights: [], fog: { enabled: false, revealed: [] }, backgroundAssetId: undefined });
+        const los = !!m.fog?.los;
+        await repo.put<MapDoc>("maps", {
+          ...m,
+          tokens: m.tokens.filter((t) => pcIds.has(t.entityId)),
+          aoeTemplates: [], walls: [], lights: [],
+          fog: los ? { enabled: true, revealed: [], los: true } : { enabled: false, revealed: [] },
+          backgroundAssetId: undefined,
+        });
       }
       if (scene) await repo.put<Scene>("scenes", { ...scene, round: 1, activeEntityId: undefined });
       clearHistory();
@@ -195,9 +230,8 @@ export default function CombatTracker({ repo, ruleset, campaignId, sceneId, owne
         <span style={{ color: C.gold, fontSize: 22, fontWeight: 800 }}>{round}</span>
         <div style={{ flex: 1 }} />
         <button style={{ ...btn(C.text), opacity: histCount ? 1 : 0.4, cursor: histCount ? "pointer" : "default" }} disabled={!histCount} onClick={undo} title="Go back to the start of the previous turn">↶ Undo turn{histCount ? ` (${histCount})` : ""}</button>
-        <button style={btn(C.text)} onClick={startTurns}>Start / Order</button>
         <button style={btn(C.gold)} onClick={rollAllNpcs}>Roll NPCs</button>
-        <button style={{ ...btn(C.gold), background: C.gold, color: "#0a0c11" }} onClick={nextTurn}>Next turn</button>
+        <button style={{ ...btn(C.gold), background: C.gold, color: "#0a0c11" }} onClick={activeId ? nextTurn : startTurns}>{activeId ? "Next turn" : "Start"}</button>
         <button style={{ ...btn(C.danger), borderColor: `${C.danger}66` }} onClick={resetCombat}>New combat</button>
       </div>
 
@@ -213,7 +247,7 @@ export default function CombatTracker({ repo, ruleset, campaignId, sceneId, owne
       </div>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-        {ordered.map((e) => {
+        {displayed.map((e) => {
           const active = e.id === activeId;
           const accent = e.color || (e.kind === "pc" ? C.pc : C.npc);
           const src = portraitSrc(e);
@@ -270,6 +304,15 @@ export default function CombatTracker({ repo, ruleset, campaignId, sceneId, owne
                   </button>
                 )}
                 {e.kind === "npc" && <button style={btn(C.gold)} onClick={() => roll(e)}>Roll</button>}
+                {e.kind === "npc" && isGm && (
+                  <button
+                    style={btn(e.attributes.hidden ? C.danger : C.text)}
+                    title={e.attributes.hidden ? "Hidden from players (map and list). Click to reveal." : "Hide from players everywhere, even in lit areas."}
+                    onClick={() => save(e, { hidden: !e.attributes.hidden })}
+                  >
+                    {e.attributes.hidden ? "Hidden" : "Hide"}
+                  </button>
+                )}
                 {e.kind === "npc" && <button style={btn(C.text)} title="Duplicate this NPC" onClick={() => cloneNpc(e)}>Clone</button>}
                 <button style={{ ...btn(C.dim), padding: "5px 8px" }} title="Remove combatant" onClick={() => removeEntity(e)}>✕</button>
               </div>

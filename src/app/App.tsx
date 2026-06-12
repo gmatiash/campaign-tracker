@@ -18,6 +18,7 @@ import MapView from "../modules/map/MapView";
 import MembersPanel from "./MembersPanel";
 import InvitePanel from "./InvitePanel";
 import GuidePanel from "./GuidePanel";
+import GmControl from "./GmControl";
 import SignIn from "./auth/SignIn";
 import { useSession } from "./auth/useSession";
 
@@ -126,6 +127,7 @@ function MainApp({ ownerId, userLabel, onSignOut }: { ownerId: Id; userLabel?: s
   const fileRef = useRef<HTMLInputElement>(null);
   const [isGm, setIsGm] = useState<boolean>(!cloud);
   const [showGuide, setShowGuide] = useState(false);
+  const [controlMode, setControlMode] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -161,7 +163,15 @@ function MainApp({ ownerId, userLabel, onSignOut }: { ownerId: Id; userLabel?: s
       const { data } = await supabase.from("campaign_members").select("role").eq("campaign_id", CAMPAIGN_ID).eq("user_id", ownerId).maybeSingle();
       if (data?.role !== "gm") { alert("Only the GM can reset the campaign."); return; }
     }
-    try { await resetToDemo(ownerId); }
+    try {
+      const prevMap = await repo.get<MapDoc>("maps", MAP_ID).catch(() => null);
+      const wasLos = !!prevMap?.fog?.los;
+      await resetToDemo(ownerId);
+      if (wasLos) {
+        const m = await repo.get<MapDoc>("maps", MAP_ID).catch(() => null);
+        if (m) await repo.put<MapDoc>("maps", { ...m, fog: { enabled: true, revealed: [], los: true }, updatedAt: Date.now() });
+      }
+    }
     catch (err) { alert("Reset failed."); console.error(err); }
   };
 
@@ -173,26 +183,41 @@ function MainApp({ ownerId, userLabel, onSignOut }: { ownerId: Id; userLabel?: s
           {cloud ? "CLOUD" : "LOCAL"}
         </span>
         {userLabel && <span style={{ fontSize: 11, color: "#99a0b0" }}>{userLabel}</span>}
+        {isGm && <button style={{ ...btnStyle, ...(controlMode ? { color: "#d4af37", borderColor: "#d4af37" } : {}) }} onClick={() => setControlMode((v) => !v)} title="A phone-friendly control surface for running combat while the map is shared from another screen.">{controlMode ? "Exit control" : "GM Control"}</button>}
         <button style={{ ...btnStyle, color: "#d4af37", borderColor: "#d4af3766" }} onClick={() => setShowGuide(true)}>Guide</button>
-        <button style={btnStyle} onClick={onExport}>Export backup</button>
-        <label style={btnStyle}>
+        {!controlMode && <button style={btnStyle} onClick={onExport}>Export backup</button>}
+        {!controlMode && <label style={btnStyle}>
           Import backup
           <input ref={fileRef} type="file" accept="application/json,.json" style={{ display: "none" }}
             onChange={(e) => { const f = e.target.files?.[0]; if (f) onImportFile(f); e.target.value = ""; }} />
-        </label>
-        <button style={{ ...btnStyle, color: "#d9544a" }} onClick={onReset}>Reset to demo</button>
-        {cloud && <InvitePanel />}
+        </label>}
+        {!controlMode && <button style={{ ...btnStyle, color: "#d9544a" }} onClick={onReset}>Reset to demo</button>}
+        {cloud && !controlMode && <InvitePanel />}
         {onSignOut && <button style={btnStyle} onClick={onSignOut}>Sign out</button>}
       </div>
-      <p style={{ fontSize: 12, color: "#99a0b0", maxWidth: 700 }}>
-        This shell consumes the active <strong>{ruleset.meta.name}</strong> ruleset and a Repository. No game
-        rules are hard-coded in the modules. {cloud
-          ? "Storage is cloud (Supabase) with realtime sync and row-level security; the first member to join a campaign is its GM."
-          : "Storage is local (IndexedDB) and persists across reloads; use Export/Import for backups."}
-      </p>
-      {cloud && <MembersPanel campaignId={CAMPAIGN_ID} currentUserId={ownerId} />}
-      <MapView repo={repo} ruleset={ruleset} campaignId={CAMPAIGN_ID} mapId={MAP_ID} sceneId={SCENE_ID} isGm={isGm} />
-      <CombatTracker repo={repo} ruleset={ruleset} campaignId={CAMPAIGN_ID} sceneId={SCENE_ID} ownerId={ownerId} />
+      {controlMode ? (
+        <div style={{ marginTop: 12 }}>
+          <p style={{ fontSize: 12, color: "#99a0b0", maxWidth: 520, margin: "0 auto 12px" }}>
+            Run combat from here while the map is shared from another screen (sign that screen in as a player and use <strong>View as player</strong>). Changes sync live.
+          </p>
+          <GmControl repo={repo} campaignId={CAMPAIGN_ID} mapId={MAP_ID} />
+          <div style={{ maxWidth: 520, margin: "12px auto 0" }}>
+            <CombatTracker repo={repo} ruleset={ruleset} campaignId={CAMPAIGN_ID} sceneId={SCENE_ID} ownerId={ownerId} mapId={MAP_ID} isGm={isGm} />
+          </div>
+        </div>
+      ) : (
+        <>
+          <p style={{ fontSize: 12, color: "#99a0b0", maxWidth: 700 }}>
+            This shell consumes the active <strong>{ruleset.meta.name}</strong> ruleset and a Repository. No game
+            rules are hard-coded in the modules. {cloud
+              ? "Storage is cloud (Supabase) with realtime sync and row-level security; the first member to join a campaign is its GM."
+              : "Storage is local (IndexedDB) and persists across reloads; use Export/Import for backups."}
+          </p>
+          {cloud && <MembersPanel campaignId={CAMPAIGN_ID} currentUserId={ownerId} />}
+          <MapView repo={repo} ruleset={ruleset} campaignId={CAMPAIGN_ID} mapId={MAP_ID} sceneId={SCENE_ID} isGm={isGm} />
+          <CombatTracker repo={repo} ruleset={ruleset} campaignId={CAMPAIGN_ID} sceneId={SCENE_ID} ownerId={ownerId} mapId={MAP_ID} isGm={isGm} />
+        </>
+      )}
       {showGuide && <GuidePanel isGm={isGm} onClose={() => setShowGuide(false)} />}
     </div>
   );

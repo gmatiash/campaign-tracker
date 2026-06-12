@@ -6,6 +6,7 @@ import { fileToImageAsset, removeImage } from "../../core/assets";
 import { detectGrid } from "../../core/gridDetect";
 import type { AoeTemplate, Asset, GridConfig, MapDoc, Wall, LightSource } from "../../core/domain/map";
 import { computeLighting } from "../../core/lighting";
+import { partyRevealCells } from "../../core/fog";
 import type { Repository } from "../../core/persistence/repository";
 import type { AoeShape, Dir8, Ruleset } from "../../core/ruleset/ruleset";
 import type { DistanceUnit } from "../../core/units";
@@ -136,7 +137,6 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
   const [roomMode, setRoomMode] = useState<"reveal" | "hide">("reveal");
   const [viewAsPlayer, setViewAsPlayer] = useState(false);
   const [showLight, setShowLight] = useState(false);
-  const [autoFog, setAutoFog] = useState(false);
   const [showRange, setShowRange] = useState(false);
   const [measure, setMeasure] = useState(false);
   const [ruler, setRuler] = useState<{ a: { gx: number; gy: number }; b: { gx: number; gy: number } } | null>(null);
@@ -336,7 +336,6 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
     () => new Set((map?.fog?.revealed ?? []).map(([x, y]) => `${x},${y}`)),
     [map?.fog?.revealed]
   );
-  const isRevealed = (gx: number, gy: number) => revealedSet.has(`${gx},${gy}`);
 
   // Wall edges keyed as "H:ix:iy" (top edge of cell ix,iy) or "V:ix:iy" (left edge).
   const wallEdge = (a: [number, number], b: [number, number]): string | null => {
@@ -471,10 +470,10 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
     return { ix: Math.round(w.wx / map.grid.cellPx), iy: Math.round(w.wy / map.grid.cellPx) };
   };
 
-  const setFog = (patch: Partial<{ enabled: boolean; revealed: Array<[number, number]> }>) => {
+  const setFog = (patch: Partial<NonNullable<MapDoc["fog"]>>) => {
     if (!map) return;
     const cur = map.fog ?? { enabled: false, revealed: [] as Array<[number, number]> };
-    saveMap({ fog: { enabled: cur.enabled, revealed: cur.revealed, ...patch } });
+    saveMap({ fog: { ...cur, ...patch } });
   };
   const fromKeys = (set: Set<string>): Array<[number, number]> => [...set].map((k) => k.split(",").map(Number) as [number, number]);
 
@@ -560,6 +559,15 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
   // Door = a wall edge flagged as a door: it still blocks the fog flood, but is
   // shown to players when an adjacent cell is revealed. Click cycles none→door→none
   // (and converts an existing plain wall into a door).
+  // A short, non-sequential code so the GM can identify a door without leaking how
+  // many doors exist (sequential numbers would).
+  const newDoorLabel = (): string => {
+    const ch = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no ambiguous 0/O/1/I
+    const used = new Set((map?.walls ?? []).filter((w) => w.door && w.label).map((w) => w.label));
+    const gen = () => ch[Math.floor(Math.random() * ch.length)] + ch[Math.floor(Math.random() * ch.length)];
+    for (let t = 0; t < 50; t++) { const s = gen(); if (!used.has(s)) return s; }
+    return gen();
+  };
   const toggleDoor = (cx: number, cy: number) => {
     if (!map) return;
     const w = toWorld(cx, cy); if (!w) return;
@@ -567,8 +575,8 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
     const walls = map.walls ?? [];
     const existing = walls.find((wl) => wallEdge(wl.points[0], wl.points[1]) === edge.key);
     if (existing && existing.door) saveMap({ walls: walls.map((wl) => (wl.id === existing.id ? { ...wl, open: !wl.open } : wl)) });
-    else if (existing) saveMap({ walls: walls.map((wl) => (wl.id === existing.id ? { ...wl, door: true, open: false } : wl)) });
-    else saveMap({ walls: [...walls, { id: uid(), points: edge.points, blocksMovement: false, blocksLight: false, blocksLineOfSight: true, blocksEffect: false, door: true, open: false }] });
+    else if (existing) saveMap({ walls: walls.map((wl) => (wl.id === existing.id ? { ...wl, door: true, open: false, label: wl.label ?? newDoorLabel() } : wl)) });
+    else saveMap({ walls: [...walls, { id: uid(), points: edge.points, blocksMovement: false, blocksLight: false, blocksLineOfSight: true, blocksEffect: false, door: true, open: false, label: newDoorLabel() }] });
   };
   // Secret door: a GM-only passage that reads as a wall to players until opened.
   const toggleSecret = (cx: number, cy: number) => {
@@ -578,8 +586,8 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
     const walls = map.walls ?? [];
     const existing = walls.find((wl) => wallEdge(wl.points[0], wl.points[1]) === edge.key);
     if (existing && existing.door) saveMap({ walls: walls.map((wl) => (wl.id === existing.id ? { ...wl, secret: !wl.secret } : wl)) });
-    else if (existing) saveMap({ walls: walls.map((wl) => (wl.id === existing.id ? { ...wl, door: true, open: false, secret: true } : wl)) });
-    else saveMap({ walls: [...walls, { id: uid(), points: edge.points, blocksMovement: false, blocksLight: false, blocksLineOfSight: true, blocksEffect: false, door: true, open: false, secret: true }] });
+    else if (existing) saveMap({ walls: walls.map((wl) => (wl.id === existing.id ? { ...wl, door: true, open: false, secret: true, label: wl.label ?? newDoorLabel() } : wl)) });
+    else saveMap({ walls: [...walls, { id: uid(), points: edge.points, blocksMovement: false, blocksLight: false, blocksLineOfSight: true, blocksEffect: false, door: true, open: false, secret: true, label: newDoorLabel() }] });
   };
   const removeDoorNear = (cx: number, cy: number) => {
     if (!map) return;
@@ -589,6 +597,14 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
   };
 
   const playerView = !isGm || viewAsPlayer;
+  // Terrain, walls and doors persist once explored (memory). The live set (current
+  // party line of sight, LoS mode only) is used to decide which NPC tokens are shown.
+  const liveVisible = useMemo(
+    () => (playerView && map?.fog?.enabled && map?.fog?.los ? partyRevealCells(map, entityById) : null),
+    [playerView, map, entityById]
+  );
+  const isExplored = (gx: number, gy: number) => revealedSet.has(`${gx},${gy}`);
+  const isCurrentlyVisible = (gx: number, gy: number) => (liveVisible ? liveVisible.has(`${gx},${gy}`) : revealedSet.has(`${gx},${gy}`));
   const fogActive = isGm && fogTool !== "off";
   const onFogPointerDown = (e: RPointerEvent<HTMLDivElement>) => {
     e.stopPropagation();
@@ -762,26 +778,14 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
   // let sight through). Reveals are additive (explored map stays revealed); the
   // lighting overlay separately dims what isn't currently lit.
   useEffect(() => {
-    if (!autoFog || !isGm || !map || !map.fog?.enabled) return;
-    const cols = Math.floor(map.width / map.grid.cellPx), rows = Math.floor(map.height / map.grid.cellPx);
-    if (cols * rows === 0 || cols * rows > 3000) return;
-    const union = new Set<string>();
-    for (const t of map.tokens) {
-      const e = entityById.get(t.entityId);
-      if (!e || e.kind !== "pc") continue;
-      union.add(`${t.gx},${t.gy}`); // a token always knows its own square
-      const seen = computeLighting({
-        sources: lightSources,
-        viewer: { gx: t.gx, gy: t.gy, lowLight: !!e.attributes.lowLight, darkvisionFt: Number(e.attributes.darkvisionFt) || 0 },
-        walls: lightWalls, cols, rows, cellFt: map.grid.cellFt, ambient,
-      });
-      for (const k of seen.keys()) union.add(k);
-    }
+    if (!isGm || !map || !map.fog?.enabled || !map.fog?.los) return;
+    const union = partyRevealCells(map, entityById);
+    if (!union) return;
     const existing = new Set((map.fog.revealed ?? []).map(([x, y]) => `${x},${y}`));
     let added = false;
     for (const k of union) if (!existing.has(k)) { existing.add(k); added = true; }
     if (added) setFog({ revealed: fromKeys(existing) });
-  }, [autoFog, isGm, map, lightSources, lightWalls, entityById]);
+  }, [isGm, map, lightSources, lightWalls, entityById]);
 
   // ---- styles --------------------------------------------------------------
   const btn = (color: string, on = false): CSSProperties => ({
@@ -856,7 +860,7 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
           <button style={btn(C.text, fogTool === "door")} onClick={() => setFogTool((t) => (t === "door" ? "off" : "door"))} title="Click a door to open/close it (or add one on an edge). Double-click to remove. Closed doors block movement, light and sight.">Door</button>
           <button style={btn(C.text, fogTool === "secret")} onClick={() => setFogTool((t) => (t === "secret" ? "off" : "secret"))} title="Secret door: looks like a wall to players until opened. Click an edge to add/toggle; double-click to remove.">Secret</button>
           <button style={btn(C.danger, fogTool === "erase")} onClick={() => setFogTool((t) => (t === "erase" ? "off" : "erase"))} title="Click a wall or door to delete it.">Erase</button>
-          <button style={btn(C.text, autoFog)} onClick={() => { const next = !autoFog; setAutoFog(next); if (next && !fog.enabled) setFog({ enabled: true }); }} title="Auto-reveal fog from each PC token's line of sight (light + vision, blocked by walls)">LoS fog</button>
+          <button style={btn(C.text, !!fog.los)} onClick={() => setFog({ enabled: fog.los ? fog.enabled : true, los: !fog.los })} title="Line-of-sight fog: reveals (and limits the player view to) what the party can currently see. Auto-updates as tokens move.">LoS fog</button>
           <button style={btn(C.dim)} onClick={revealAll}>Reveal all</button>
           <button style={btn(C.dim)} onClick={hideAll}>Hide all</button>
           <button style={btn(C.gold, viewAsPlayer)} onClick={() => setViewAsPlayer((v) => !v)} title="Preview exactly what players see">{viewAsPlayer ? "Player view" : "View as player"}</button>
@@ -996,17 +1000,21 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
             );
 
             return placed.map(({ t, e, sd, gx, gy }) => {
-              // In player view, don't draw tokens sitting entirely in unrevealed cells.
-              if (playerView && fog.enabled) {
+              const isDragging = drag?.entityId === t.entityId;
+              // GM-marked hidden NPCs never appear to players (even in lit, revealed cells).
+              if (playerView && !isDragging && e.kind === "npc" && e.attributes.hidden) return null;
+              // Player view: NPC tokens only show where the party can CURRENTLY see them
+              // (PC tokens are the party and always show; explored terrain stays visible).
+              if (playerView && fog.enabled && e.kind === "npc" && !isDragging) {
                 let anyVisible = false;
                 for (let dx = 0; dx < sd.footprint && !anyVisible; dx++)
                   for (let dy = 0; dy < sd.footprint && !anyVisible; dy++)
-                    if (isRevealed(gx + dx, gy + dy)) anyVisible = true;
+                    if (isCurrentlyVisible(gx + dx, gy + dy)) anyVisible = true;
                 if (!anyVisible) return null;
               }
-              // When previewing a selected token's vision (Light on), hide tokens it
-              // can't see — a lit cell behind a wall is outside its line of sight.
-              if (showLight && viewer && lighting && t.entityId !== selected) {
+              // GM authoring preview only: when previewing a selected token's vision
+              // (Light on), hide tokens it can't see. Never applies in the player view.
+              if (!playerView && showLight && viewer && lighting && t.entityId !== selected) {
                 let seen = false;
                 for (let dx = 0; dx < sd.footprint && !seen; dx++)
                   for (let dy = 0; dy < sd.footprint && !seen; dy++)
@@ -1030,15 +1038,16 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
               const shown = conds.slice(0, 6);
               const extra = conds.length - shown.length;
               const down = conds.some((c) => c.defeated); // dead / unconscious
+              const hidden = !!e.attributes.hidden; // GM-only cue (players never reach here)
               const badge = Math.max(10, Math.min(15, g.cellPx * 0.26));
 
               return (
                 <div key={t.entityId}
                   onPointerDown={(ev) => onTokenPointerDown(ev, t)} onPointerMove={onTokenPointerMove} onPointerUp={onTokenPointerUp}
                   onDoubleClick={(ev) => { ev.stopPropagation(); removeToken(t.entityId); }}
-                  title={`${e.name}${conds.length ? " — " + conds.map((c) => c.label).join(", ") : ""}`}
+                  title={`${e.name}${hidden ? " — hidden from players" : ""}${conds.length ? " — " + conds.map((c) => c.label).join(", ") : ""}`}
                   style={{ position: "absolute", left: g.offsetX + gx * g.cellPx, top: g.offsetY + gy * g.cellPx, width: box, height: box, transform: `translate(${pl.dx}px, ${pl.dy}px)`, display: "flex", alignItems: "center", justifyContent: "center", cursor: "grab", zIndex: down && !isActive && !isSel ? 4 : z }}>
-                  <div style={{ width: dia, height: dia, borderRadius: "50%", overflow: "hidden", background: portrait ? "#0a0c11" : `${accent}cc`, border: `2px solid ${isActive ? C.gold : "#0a0c11"}`, boxShadow: ring, filter: down ? "grayscale(100%)" : undefined, opacity: down ? 0.5 : 1, display: "flex", alignItems: "center", justifyContent: "center", color: "#0a0c11", fontWeight: 800, fontSize: Math.max(9, Math.min(16, dia * 0.4)) }}>
+                  <div style={{ width: dia, height: dia, borderRadius: "50%", overflow: "hidden", background: portrait ? "#0a0c11" : `${accent}cc`, border: `2px ${hidden ? "dashed" : "solid"} ${isActive ? C.gold : hidden ? "#d4af37" : "#0a0c11"}`, boxShadow: ring, filter: down ? "grayscale(100%)" : undefined, opacity: down ? 0.5 : hidden ? 0.5 : 1, display: "flex", alignItems: "center", justifyContent: "center", color: "#0a0c11", fontWeight: 800, fontSize: Math.max(9, Math.min(16, dia * 0.4)) }}>
                     {portrait
                       ? <img src={portrait} alt="" draggable={false} style={{ width: "100%", height: "100%", objectFit: "cover", userSelect: "none" }} />
                       : initials(e.name)}
@@ -1142,33 +1151,48 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
             const { cols, rows } = gridDims();
             const hidden: Array<[number, number]> = [];
             if (fog.enabled) {
-              for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) if (!isRevealed(x, y)) hidden.push([x, y]);
+              for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) if (!isExplored(x, y)) hidden.push([x, y]);
             }
             const fogA = playerView ? 1 : 0.45;
             const all = map.walls ?? [];
-            const walls = all.filter((w) => !w.door);
-            const doors = all.filter((w) => w.door);
-            const doorVisibleToPlayer = (w: Wall) => {
+            // A closed secret door looks and behaves like a wall until it's opened.
+            const isSecretWall = (w: Wall) => !!(w.door && w.secret && !doorOpen(w));
+            const wallLines = all.filter((w) => !w.door || isSecretWall(w));
+            const doorRects = all.filter((w) => w.door && !isSecretWall(w));
+            // A wall/door edge is "seen" when a cell on either side has been explored.
+            const edgeSeen = (w: Wall) => {
               const [[ax, ay], [bx, by]] = [w.points[0], w.points[1]];
               const adj: Array<[number, number]> = ay === by
                 ? [[Math.min(ax, bx), ay - 1], [Math.min(ax, bx), ay]]
                 : [[ax - 1, Math.min(ay, by)], [ax, Math.min(ay, by)]];
-              return adj.some(([x, y]) => isRevealed(x, y));
+              return adj.some(([x, y]) => isExplored(x, y));
             };
+            const fs = Math.max(9, Math.min(14, g.cellPx * 0.3));
             return (
               <svg width={map.width} height={map.height} style={{ position: "absolute", left: 0, top: 0, pointerEvents: "none", zIndex: 18 }}>
                 {fog.enabled && hidden.map(([x, y]) => (
                   <rect key={`fog-${x}-${y}`} x={g.offsetX + x * g.cellPx} y={g.offsetY + y * g.cellPx} width={g.cellPx} height={g.cellPx} fill="#05070b" opacity={fogA} />
                 ))}
-                {!playerView && walls.map((w) => {
+                {wallLines.map((w) => {
+                  // GM sees every wall; players see it once a cell beside it is explored.
+                  if (playerView && !edgeSeen(w)) return null;
+                  const secretWall = isSecretWall(w);
                   const [[ax, ay], [bx, by]] = [w.points[0], w.points[1]];
-                  return <line key={w.id} x1={g.offsetX + ax * g.cellPx} y1={g.offsetY + ay * g.cellPx} x2={g.offsetX + bx * g.cellPx} y2={g.offsetY + by * g.cellPx} stroke="#e8b54a" strokeWidth={4} strokeLinecap="round" opacity={0.95} />;
+                  const stroke = secretWall && !playerView ? "#c084fc" : "#e8b54a"; // players just see a wall
+                  const lx = g.offsetX + ((ax + bx) / 2) * g.cellPx, ly = g.offsetY + ((ay + by) / 2) * g.cellPx;
+                  return (
+                    <g key={w.id}>
+                      <line x1={g.offsetX + ax * g.cellPx} y1={g.offsetY + ay * g.cellPx} x2={g.offsetX + bx * g.cellPx} y2={g.offsetY + by * g.cellPx} stroke={stroke} strokeWidth={4} strokeLinecap="round" opacity={0.95} strokeDasharray={secretWall && !playerView ? "6 4" : undefined} />
+                      {secretWall && !playerView && w.label && (
+                        <text x={lx} y={ly - 4} textAnchor="middle" fontSize={fs} fontWeight={800} fill="#e9c9ff" stroke="#05070b" strokeWidth={2.5} paintOrder="stroke">{w.label}</text>
+                      )}
+                    </g>
+                  );
                 })}
-                {doors.map((w) => {
+                {doorRects.map((w) => {
                   const open = doorOpen(w);
-                  // Players never see a secret door until it's opened (it reads as wall = invisible to them).
-                  if (playerView && w.secret && !open) return null;
-                  if (playerView && !open && !doorVisibleToPlayer(w)) return null;
+                  // A door stays visible once its area has been explored.
+                  if (playerView && !edgeSeen(w)) return null;
                   const [[ax, ay], [bx, by]] = [w.points[0], w.points[1]];
                   const horizontal = ay === by;
                   const mx = g.offsetX + ((ax + bx) / 2) * g.cellPx;
@@ -1177,7 +1201,14 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
                   const w_ = horizontal ? long : thick, h_ = horizontal ? thick : long;
                   const fill = open ? "rgba(185,130,79,0.18)" : w.secret ? "rgba(168,85,247,0.45)" : "#b9824f";
                   const stroke = w.secret && !playerView ? "#c084fc" : "#f0dcae";
-                  return <rect key={w.id} x={mx - w_ / 2} y={my - h_ / 2} width={w_} height={h_} rx={2} fill={fill} stroke={stroke} strokeWidth={1.5} strokeDasharray={open || (w.secret && !playerView) ? "4 3" : undefined} />;
+                  return (
+                    <g key={w.id}>
+                      <rect x={mx - w_ / 2} y={my - h_ / 2} width={w_} height={h_} rx={2} fill={fill} stroke={stroke} strokeWidth={1.5} strokeDasharray={open || (w.secret && !playerView) ? "4 3" : undefined} />
+                      {w.label && (
+                        <text x={mx} y={my - h_ / 2 - 2} textAnchor="middle" fontSize={fs} fontWeight={800} fill="#ffe9b0" stroke="#05070b" strokeWidth={2.5} paintOrder="stroke">{w.label}</text>
+                      )}
+                    </g>
+                  );
                 })}
                 {boxRect && (() => {
                   const x0 = Math.min(boxRect.x0, boxRect.x1), x1 = Math.max(boxRect.x0, boxRect.x1);
