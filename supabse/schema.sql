@@ -107,10 +107,15 @@ create policy records_select on public.records for select to authenticated
     and ((visibility->>'kind') is distinct from 'gmOnly' or public.is_gm(campaign_id))
   );
 
--- Insert your own records into a campaign you belong to.
+-- Insert your own records into a campaign you belong to. GMs may write any
+-- record in the campaign (needed because saves are upserts: editing or deleting
+-- another member's record runs this INSERT check on the upsert).
 drop policy if exists records_insert on public.records;
 create policy records_insert on public.records for insert to authenticated
-  with check (public.is_member(campaign_id) and owner_id = auth.uid());
+  with check (
+    public.is_member(campaign_id)
+    and (owner_id = auth.uid() or public.is_gm(campaign_id))
+  );
 
 -- Update records you own, or any record if you are the GM.
 drop policy if exists records_update on public.records;
