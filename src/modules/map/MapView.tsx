@@ -66,6 +66,14 @@ interface Placement { dx: number; dy: number; z: number; }
  *    Diminutive 5x5, Fine 10x10) so several fit one square;
  *  - same-square Small+ tokens fan diagonally so each stays partly visible.
  */
+// Spreadsheet-style column label: 0 -> A, 25 -> Z, 26 -> AA, ...
+function colLabel(n: number): string {
+  let s = "";
+  let v = n + 1;
+  while (v > 0) { const r = (v - 1) % 26; s = String.fromCharCode(65 + r) + s; v = Math.floor((v - 1) / 26); }
+  return s;
+}
+
 function computePlacements(items: PlacedToken[], cellPx: number): Map<string, Placement> {
   const byCell = new Map<string, PlacedToken[]>();
   for (const it of items) {
@@ -793,6 +801,7 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
     color: on ? C.gold : color, borderRadius: 6, padding: "5px 9px", fontSize: 12, fontWeight: 700, cursor: "pointer",
   });
   const label: CSSProperties = { color: C.dim, fontSize: 11, fontWeight: 700 };
+  const numInput: CSSProperties = { width: 56, background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6, padding: "3px 6px", fontSize: 12 };
 
   if (!map) return <div style={{ marginTop: 16, color: C.dim, fontSize: 13 }}>Loading map…</div>;
 
@@ -820,7 +829,11 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
         </label>
         <span style={label}>Cell</span>
         <input type="range" min={16} max={200} value={g.cellPx} onChange={(e) => setGrid({ cellPx: Number(e.target.value) })} />
-        <span style={{ ...label, width: 36 }}>{g.cellPx}px</span>
+        <input type="number" min={4} max={400} value={g.cellPx} onChange={(e) => { const v = Math.round(Number(e.target.value)); if (Number.isFinite(v) && v > 0) setGrid({ cellPx: v }); }} style={numInput} title="Grid cell size in pixels — type to match your map image" />
+        <span style={label}>px</span>
+        <input type="number" min={1} max={1000} step={1} value={g.cellFt} onChange={(e) => { const v = Number(e.target.value); if (Number.isFinite(v) && v > 0) setGrid({ cellFt: v }); }} style={numInput} title="Real-world size of one cell (used for distances and AoE templates)" />
+        <span style={label} title="Cells are measured in feet; the Units toggle only changes how distances are displayed">ft/cell</span>
+        <button style={btn(C.text, !!g.coords)} onClick={() => setGrid({ coords: !g.coords })} title="Show spreadsheet-style column letters (top) and row numbers (left)">Coords</button>
         <span style={label}>Color</span>
         <input type="color" value={toHex(g.color)} onChange={(e) => setGrid({ color: e.target.value })} style={{ width: 30, height: 24, padding: 0, border: `1px solid ${C.border}`, background: "transparent" }} />
         <span style={label}>Off X</span>
@@ -908,6 +921,21 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
             : <div style={{ position: "absolute", inset: 0, background: "repeating-linear-gradient(45deg,#0d1017,#0d1017 12px,#0f131c 12px,#0f131c 24px)" }} />}
 
           <div style={{ position: "absolute", inset: 0, ...gridLayer }} />
+
+          {/* spreadsheet-style coordinate headers (top = letters, left = numbers) */}
+          {g.coords && g.kind !== "gridless" && (() => {
+            const { cols, rows } = gridDims();
+            if (cols * rows === 0 || cols + rows > 600) return null; // keep it cheap
+            const fs = Math.max(8, Math.min(13, g.cellPx * 0.34));
+            const band = Math.max(fs + 4, g.cellPx * 0.42);
+            const cell = (key: string, left: number, top: number, w: number, hgt: number, text: string) => (
+              <div key={key} style={{ position: "absolute", left, top, width: w, height: hgt, display: "flex", alignItems: "center", justifyContent: "center", fontSize: fs, fontWeight: 800, color: "#ffe9b0", background: "rgba(10,12,17,0.62)", textShadow: "0 1px 2px #000" }}>{text}</div>
+            );
+            const out: JSX.Element[] = [];
+            for (let x = 0; x < cols; x++) out.push(cell(`cl-${x}`, g.offsetX + x * g.cellPx, g.offsetY, g.cellPx, band, colLabel(x)));
+            for (let y = 0; y < rows; y++) out.push(cell(`rl-${y}`, g.offsetX, g.offsetY + y * g.cellPx, band, g.cellPx, String(y + 1)));
+            return <div style={{ position: "absolute", inset: 0, zIndex: 19, pointerEvents: "none" }}>{out}</div>;
+          })()}
 
           {/* reach overlay */}
           {showReach && !playerView && map.tokens.map((t) => {
@@ -1249,8 +1277,9 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
             style={{ position: "absolute", top: 10, left: "50%", transform: "translateX(-50%)", zIndex: 55, background: C.panel, border: `1px solid ${C.border}`, borderRadius: 9, padding: "8px 10px", display: "flex", alignItems: "center", gap: 10, boxShadow: "0 8px 24px rgba(0,0,0,0.5)", flexWrap: "wrap", maxWidth: "92%" }}>
             <span style={{ color: C.gold, fontWeight: 800, fontSize: 12, textTransform: "capitalize" }}>{selectedTpl.shape}</span>
             <span style={label}>Size</span>
-            <input type="range" min={5} max={60} step={5} value={selectedTpl.sizeFt} onChange={(e) => updateTpl(selectedTpl.id, { sizeFt: Number(e.target.value) })} />
-            <span style={{ ...label, width: 44 }}>{formatDistance(selectedTpl.sizeFt, { unit })}</span>
+            <input type="range" min={5} max={120} step={5} value={selectedTpl.sizeFt} onChange={(e) => updateTpl(selectedTpl.id, { sizeFt: Number(e.target.value) })} />
+            <input type="number" min={1} max={1000} step={5} value={selectedTpl.sizeFt} onChange={(e) => { const v = Number(e.target.value); if (Number.isFinite(v) && v > 0) updateTpl(selectedTpl.id, { sizeFt: v }); }} style={numInput} title="Area size in feet" />
+            <span style={{ ...label, width: 44 }}>ft ({formatDistance(selectedTpl.sizeFt, { unit })})</span>
             <span style={label}>Effect</span>
             <select
               value={selectedTpl.effect?.kind === "custom" ? "custom" : selectedTpl.effect?.kind ?? "none"}
@@ -1275,7 +1304,8 @@ export default function MapView({ repo, ruleset, campaignId, mapId, sceneId, isG
                 <>
                   <span style={label}>Aim</span>
                   <input type="range" min={0} max={355} step={5} value={curDeg} onChange={(e) => updateTpl(selectedTpl.id, { angleDeg: Number(e.target.value) })} />
-                  <span style={{ ...label, width: 34 }}>{curDeg}°</span>
+                  <input type="number" min={0} max={359} step={1} value={curDeg} onChange={(e) => { let v = Math.round(Number(e.target.value)); if (!Number.isFinite(v)) return; v = ((v % 360) + 360) % 360; updateTpl(selectedTpl.id, { angleDeg: v }); }} style={numInput} title="Aim direction in degrees (0 = east, clockwise)" />
+                  <span style={{ ...label, width: 18 }}>°</span>
                   <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 22px)", gridTemplateRows: "repeat(3, 22px)", gap: 2 }}>
                     {COMPASS.map((d, i) => d === null
                       ? <div key={i} />

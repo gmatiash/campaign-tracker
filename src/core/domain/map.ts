@@ -11,6 +11,7 @@ export interface GridConfig {
   offsetX: number;
   offsetY: number;
   color: string;
+  coords?: boolean; // show spreadsheet-style column letters / row numbers
 }
 
 export interface TokenPlacement {
